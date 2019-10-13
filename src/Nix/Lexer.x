@@ -57,7 +57,7 @@ tokens :-
 
   \=\=        { tk TEq }
   \!\=        { tk TNeq }
-  \<\=        { tk TLeq}
+  \<\=        { tk TLeq }
   \>\=        { tk TGeq }
   \&\&        { tk TAnd }
   \|\|        { tk TOr }
@@ -84,7 +84,9 @@ tokens :-
 
 {
 -- Helper token data types
-data Tk = TIf | TThen | TElse | TAssert | TWith | TLet | TIn | TRec | TInherit | TOrKW | TEllipsis | TEq | TNeq | TLeq | TGeq | TAnd | TOr | TImpl | TUpdate | TConcat | TDollarCurly | TIndStrOpen | TIndStrClose
+data Tk = TIf | TThen | TElse | TAssert | TWith | TLet | TIn | TRec
+  | TInherit | TOrKW | TEllipsis | TEq | TNeq | TLeq | TGeq | TAnd | TOr
+  | TImpl | TUpdate | TConcat | TDollarCurly | TIndStrOpen | TIndStrClose
   deriving (Show, Eq, Ord)
 data Ts = TId | TPath | THPath | TSPath | TUri
   deriving (Show, Eq, Ord)
@@ -265,12 +267,12 @@ instance P.Stream TokenStream where
   -- Pretty-print non-empty stream of tokens. This function is also used
   -- to print single tokens (represented as singleton lists).
   showTokens :: Proxy TokenStream -> NonEmpty Token -> String
-  showTokens Proxy ne = L.intercalate " " $ toList ne <&> \case
+  showTokens Proxy ne = L.intercalate " " . NE.toList $ stringPretty . NE.fromList <$> (ne <&> \case
     TTk k -> tkPretty k
     TChar c -> charPretty c
     TInt i -> show i
     TFloat d -> show d
-    TText s txt -> ttextPretty s txt
+    TText s txt -> ttextPretty s txt)
 
   -- Megaparsec uses these to pretty print error messages.
   -- Mostly copied from internal Megaparsec helpers (FreeBSD license).
@@ -351,7 +353,7 @@ tkPretty = \case
   TWith -> "with" ; TLet -> "let" ; TIn -> "in" ; TRec -> "rec"
   TInherit -> "inherit" ; TOrKW -> "or" ; TEllipsis -> "..." ; TEq -> "=="
   TNeq -> "!=" ; TLeq -> "<=" ; TGeq -> ">=" ; TAnd -> "&&" ; TOr -> "||"
-  TImpl -> "->" ; TUpdate -> "//" ; TConcat -> "++" TDollarCurly -> "${"
+  TImpl -> "->" ; TUpdate -> "//" ; TConcat -> "++" ; TDollarCurly -> "${"
   TIndStrOpen -> "''" ; TIndStrClose -> "''"
 
 ttextPretty :: Ts -> Text -> String
