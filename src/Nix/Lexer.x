@@ -43,12 +43,38 @@ import qualified Text.Megaparsec as P
   ([Ee] [\+\-]? [0-9]+)?    -- exponent, like scientific notation
 
 tokens :-
+  if          { tk TIf }
+  then        { tk TThen }
+  else        { tk TElse }
+  assert      { tk TAssert }
+  with        { tk TWith }
+  let         { tk TLet }
+  in          { tk TIn }
+  rec         { tk TRec }
+  inherit     { tk TInherit }
+  or          { tk TOrKW }
+  \.\.\.      { tk TEllipsis }
+
+  \=\=        { tk TEq }
+  \!\=        { tk TNeq }
+  \<\=        { tk TLeq}
+  \>\=        { tk TGeq }
+  \&\&        { tk TAnd }
+  \|\|        { tk TOr }
+  \-\>        { tk TImpl }
+  \/\/        { tk TUpdate }
+  \+\+        { tk TConcat }
+
+  -- TODO identifiers
+
   @int   { \txt s -> (TInt . read . T.unpack $ txt, s) }
   @float { \txt s -> (TFloat . read . fixup . T.unpack $ txt, s)
                  -- In Haskell, `read ".5"` throws
            where fixup ('.':rest) = "0." <> rest
                  fixup xs = xs
          }
+
+  -- TODO other strings
 
   [\ \t\r\n]+ ; -- eat up whitespace
   \# [^\r\n]* ; -- single-line comments
@@ -72,7 +98,7 @@ data Token = TTk !Tk
 
 -- Stack of start codes
 type Stack = NonEmpty Int
--- Text of the mach and the stack (see %action, above)
+-- Text of the match and the stack (see %action, above)
 type AlexAction = Text -> Stack -> (Token, Stack)
 
 -- Helpers for constructors of Token (besides TInt and TFloat)
@@ -161,7 +187,7 @@ instance P.Stream TokenStream where
   chunkEmpty Proxy = null
 
   -- Megaparsec documentation:
-  -- Extract a single token form the stream. Return Nothing if the
+  -- Extract a single token from the stream. Return Nothing if the
   -- stream is empty.
   take1_ :: TokenStream -> Maybe (Token, TokenStream)
   take1_ =
@@ -325,8 +351,8 @@ tkPretty = \case
   TWith -> "with" ; TLet -> "let" ; TIn -> "in" ; TRec -> "rec"
   TInherit -> "inherit" ; TOrKW -> "or" ; TEllipsis -> "..." ; TEq -> "=="
   TNeq -> "!=" ; TLeq -> "<=" ; TGeq -> ">=" ; TAnd -> "&&" ; TOr -> "||"
-  TImpl -> "->" ; TUpdate -> "update" ; TConcat -> "concat"
-  TDollarCurly -> "${"; TIndStrOpen -> "''"; TIndStrClose -> "''"
+  TImpl -> "->" ; TUpdate -> "//" ; TConcat -> "++" TDollarCurly -> "${"
+  TIndStrOpen -> "''" ; TIndStrClose -> "''"
 
 ttextPretty :: Ts -> Text -> String
 ttextPretty THPath txt = '~' : T.unpack txt
