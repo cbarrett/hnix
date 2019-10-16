@@ -32,10 +32,11 @@ import           Data.Word (Word8)
 
 %action "AlexAction"
 
-$pseg  = [a-zA-Z0-9\.\_\-\+]
+$id    = [ a-z A-Z 0-9 \_ \- \. ]
+$pseg  = [ a-z A-Z 0-9 \_ \- \+ \/ ]
 
 @any   = . | \n
-@id    = [a-zA-Z\_] [a-zA-Z0-9\_\'\-]*
+@id    = ($id # [ \' \- ]) $id*
 @int   = [0-9]+
 @float =
   -- all floats one and greater
