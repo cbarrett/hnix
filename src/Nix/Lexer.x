@@ -32,12 +32,23 @@ import           Data.Word (Word8)
 
 %action "AlexAction"
 
+$pseg  = [a-zA-Z0-9\.\_\-\+]
+
 @any   = . | \n
+@id    = [a-zA-Z\_] [a-zA-Z0-9\_\'\-]*
 @int   = [0-9]+
 @float =
-  (([1-9] [0-9]* \. [0-9]*) -- all floats one and greater
-  |(0? \. [0-9]+))          -- or optional zero, with decimal
-  ([Ee] [\+\-]? [0-9]+)?    -- exponent, like scientific notation
+  -- all floats one and greater
+  (( [1-9] [0-9]* \. [0-9]* )
+  -- or decimal, with optional zero
+  |( 0?  \. [0-9]+ ))
+  -- exponent
+  ([Ee] [\+\-]? [0-9]+)?
+@path  = $pseg* ( \/ $pseg+ )+ \/?
+@hpath = \~ ( \/ $pseg+ )+ \/?
+@spath = \< $pseg+ ( \/ $pseg+ )* \>
+@uri   =
+  [a-zA-Z] [a-zA-Z0-9\+\-\.]* \: [a-zA-Z0-9\%\/\?\:\@\&\=\+\$\,\-\_\.\!\~\*\']+
 
 tokens :-
   if          { tk TIf }
@@ -62,7 +73,7 @@ tokens :-
   \/\/        { tk TUpdate }
   \+\+        { tk TConcat }
 
-  -- TODO identifiers
+  @id    { text TId }
 
   @int   { \txt s -> (TInt . read . T.unpack $ txt, s) }
   @float { \txt s -> (TFloat . read . fixup . T.unpack $ txt, s)
@@ -72,6 +83,11 @@ tokens :-
          }
 
   -- TODO other strings
+
+  @path  { text TPath }
+  @hpath { text THPath }
+  @spath { text TSPath }
+  @uri   { text TUri }
 
   [\ \t\r\n]+ ; -- eat up whitespace
   \# [^\r\n]* ; -- single-line comments
