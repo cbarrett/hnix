@@ -470,6 +470,7 @@ library
       Nix.TH
       Nix.Thunk
       Nix.Thunk.Basic
+      Nix.TokenStream
       Nix.Type.Assumption
       Nix.Type.Env
       Nix.Type.Infer
