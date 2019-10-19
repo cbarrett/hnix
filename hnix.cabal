@@ -455,6 +455,7 @@ library
       Nix.Fresh
       Nix.Fresh.Basic
       Nix.Json
+      Nix.Lexer
       Nix.Lint
       Nix.Normal
       Nix.Options
@@ -484,7 +485,6 @@ library
       Nix.XML
   other-modules:
       Paths_hnix
-      Nix.Lexer
   hs-source-dirs:
       src
   ghc-options: -Wall -fprint-potential-instances
@@ -634,6 +634,7 @@ test-suite hnix-tests
   other-modules:
       EvalTests
       NixLanguageTests
+      LexerTests
       ParserTests
       PrettyParseTests
       PrettyTests

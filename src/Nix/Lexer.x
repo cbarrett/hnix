@@ -13,7 +13,7 @@
 {-# LANGUAGE TypeFamilies #-}
 {-# OPTIONS_GHC -funbox-strict-fields #-}
 module Nix.Lexer ( Token(..), Tk(..), Ts(..), Stack
-                 , AlexInput(..), alexScan, AlexReturn(..)
+                 , AlexInput(..), alexScan, alexScanTokens, AlexReturn(..)
                  ) where
                    -- TODO replace token datatypes with combinators
 
@@ -32,24 +32,25 @@ import           Data.Word (Word8)
 
 %action "AlexAction"
 
-$id    = [ a-z A-Z 0-9 \_ \- \. ]
-$pseg  = [ a-z A-Z 0-9 \_ \- \+ \/ ]
+$alf  = [a-zA-Z]
+$num  = [0-9]
+$id0  = [$alf \_]
+$id   = [$id0 $num \'\-]
+$pseg = [$alf $num \.\_\-\+]
 
 @any   = . | \n
-@id    = ($id # [ \' \- ]) $id*
-@int   = [0-9]+
+@id    = $id0 $id*
+@int   = $num+
 @float =
-  -- all floats one and greater
-  (( [1-9] [0-9]* \. [0-9]* )
-  -- or decimal, with optional zero
-  |( 0?  \. [0-9]+ ))
-  -- exponent
-  ([Ee] [\+\-]? [0-9]+)?
-@path  = $pseg* ( \/ $pseg+ )+ \/?
-@hpath = \~ ( \/ $pseg+ )+ \/?
-@spath = \< $pseg+ ( \/ $pseg+ )* \>
+  ($num#0 $num* \. $num*
+  |0? \. $num+)
+  ([Ee] [\+\-]? $num+)?
+@path  = $pseg* (\/ $pseg+)+ \/?
+@hpath = \~ (\/ $pseg+)+ \/?
+@spath = \< $pseg+ (\/ $pseg+)* \>
 @uri   =
-  [a-zA-Z] [a-zA-Z0-9\+\-\.]* \: [a-zA-Z0-9\%\/\?\:\@\&\=\+\$\,\-\_\.\!\~\*\']+
+  $alf [$alf $num \+\-\.]* \:
+  [$alf $num \%\/\?\:\@\&\=\+\$\,\-\_\.\!\~\*\']+
 
 tokens :-
   if          { tk TIf }
@@ -86,8 +87,10 @@ tokens :-
   -- TODO other strings
 
   @path  { text TPath }
-  @hpath { text THPath }
-  @spath { text TSPath }
+                   -- drop leading ~
+  @hpath { \txt -> text THPath (T.tail txt) }
+                   -- drop leading < and trailing >
+  @spath { \txt -> text TSPath (T.init . T.tail $ txt) }
   @uri   { text TUri }
 
   [\ \t\r\n]+ ; -- eat up whitespace
@@ -192,5 +195,17 @@ utf8Encode = B.pack . map fromIntegral . go . ord
                         , 0x80 + oc .&. 0x3f
                         ]
 
+-- For debugging, doesn't involve TokenStream or Megaparsec
+alexScanTokens :: Text -> Either Int [Token]
+alexScanTokens txt = go AI{ input=txt, offset=0, charBuffer=B.empty }
+                        (0:|[])
+  where go ai@AI{ input } stack =
+          case alexScan ai (NE.head stack) of
+            AlexEOF -> Right []
+            AlexError AI{ offset } -> Left offset
+            AlexSkip ai' _len -> go ai' stack
+            AlexToken ai' len act ->
+              let (hed, stack') = act (T.take len input) stack
+              in (hed :) <$> go ai' stack'
 
 }

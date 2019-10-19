@@ -24,10 +24,11 @@ import           Nix.Parser
 import           Nix.Standard
 import           Nix.Value
 import qualified NixLanguageTests
+import qualified LexerTests
 import qualified ParserTests
 import qualified PrettyTests
-import qualified ReduceExprTests
 import qualified PrettyParseTests
+import qualified ReduceExprTests
 import           System.Directory
 import           System.Environment
 import           System.FilePath.Glob
@@ -101,7 +102,8 @@ main = do
     [ ParserTests.tests
     , EvalTests.tests
     , PrettyTests.tests
-    , ReduceExprTests.tests] ++
+    , ReduceExprTests.tests
+    , LexerTests.tests] ++
     [ PrettyParseTests.tests
         (fromIntegral (read (fromMaybe "0" prettyTestsEnv) :: Int)) ] ++
     [ evalComparisonTests ] ++
