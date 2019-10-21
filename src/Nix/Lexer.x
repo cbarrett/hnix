@@ -21,6 +21,7 @@ import           Data.Bits (shiftR, (.&.))
 import           Data.ByteString (ByteString)
 import qualified Data.ByteString as B
 import           Data.Char (ord)
+import           Data.Function ((&))
 import           Data.List.NonEmpty (NonEmpty(..), (<|))
 import qualified Data.List.NonEmpty as NE
 import           Data.Maybe (fromJust)
@@ -45,8 +46,8 @@ $pseg = [$alf $num \.\_\-\+]
   ($num#0 $num* \. $num*
   |0? \. $num+)
   ([Ee] [\+\-]? $num+)?
-@path  = $pseg* (\/ $pseg+)+ \/?
 @hpath = \~ (\/ $pseg+)+ \/?
+@path  = $pseg* (\/ $pseg+)+ \/?
 @spath = \< $pseg+ (\/ $pseg+)* \>
 @uri   =
   $alf [$alf $num \+\-\.]* \:
@@ -84,7 +85,21 @@ tokens :-
                  fixup xs = xs
          }
 
-  -- TODO other strings
+  -- TODO antiquotation
+
+  <0>\" { char '"' & push str }
+  <str>([^ \" \\]
+       |\\ @any)+ { text TStr . unescape }
+  <str>\"         { char '"' & pop }
+  <str>\\         { const $ text TStr "\\" }
+
+  <0>\'\'(\ *\n)? { tk TIndStrOpen & push indStr }
+  <indStr>([^\']
+          | \' [^\'])+ { text TIndStr }
+  <indStr>\'\'\\@any   { text TIndStr . unescape . T.drop 2 }
+  <indStr>\'\'\'       { const $ text TIndStr "''" }
+  <indStr>\'\'         { tk TIndStrClose & pop }
+  <indStr>\'           { const $ text TIndStr "'" }
 
   @path  { text TPath }
                    -- drop leading ~
@@ -105,7 +120,7 @@ data Tk = TIf | TThen | TElse | TAssert | TWith | TLet | TIn | TRec
   | TInherit | TOrKW | TEllipsis | TEq | TNeq | TLeq | TGeq | TAnd | TOr
   | TImpl | TUpdate | TConcat | TDollarCurly | TIndStrOpen | TIndStrClose
   deriving (Show, Eq, Ord)
-data Ts = TId | TPath | THPath | TSPath | TUri
+data Ts = TId | TPath | THPath | TSPath | TUri | TStr | TIndStr
   deriving (Show, Eq, Ord)
 -- Data type representing each case of token data we can have
 data Token = TTk !Tk
@@ -133,6 +148,16 @@ push sc act = \txt s -> act txt (sc <| s)
 pop :: AlexAction -> AlexAction
 pop act = \txt s -> let (_, rest) = NE.uncons s
                     in act txt (fromJust rest)
+
+unescape :: Text -> Text
+unescape txt = case T.uncons txt of
+  Just ('\\', rest') -> case T.uncons rest' of
+    Just ('n', rest) -> T.cons '\n' (unescape rest)
+    Just ('t', rest) -> T.cons '\t' (unescape rest)
+    Just (c  , rest) -> T.cons c    (unescape rest)
+    Nothing -> rest'
+  Just (c, rest') -> T.cons c (unescape rest')
+  Nothing -> txt
 
 -- Required by Alex
 -- Alex doesn't care what this type is; we have to provide it

@@ -45,6 +45,17 @@ case_identifier_special_chars = do
   assertLex ".a" [TChar '.', TText TId "a"]
   assertLex "'a" [TChar '\'', TText TId "a"]
 
+case_string_escape = do
+  assertLex "\"\\n\\t\\\\\"" [TChar '"', TText TStr "\n\t\\", TChar '"']
+  assertLex "\" \\\" \\' \"" [TChar '"', TText TStr " \" ' ", TChar '"']
+
+case_indented_string_escape = do
+  assertLex "'' ''\\n ''\\t ''\\\\ \\ \\n ' ''' ''"
+    [ TTk TIndStrOpen , TText TIndStr " ", TText TIndStr "\n", TText TIndStr " "
+    , TText TIndStr "\t", TText TIndStr " ", TText TIndStr "\\"
+    , TText TIndStr " \\ \\n ' ", TText TIndStr "''", TText TIndStr " "
+    , TTk TIndStrClose ]
+
 tests :: TestTree
 tests = $testGroupGenerator
 
