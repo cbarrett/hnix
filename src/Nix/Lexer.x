@@ -54,65 +54,65 @@ $pseg = [$alf $num \.\_\-\+]
   [$alf $num \%\/\?\:\@\&\=\+\$\,\-\_\.\!\~\*\']+
 
 tokens :-
-  if          { tk TIf }
-  then        { tk TThen }
-  else        { tk TElse }
-  assert      { tk TAssert }
-  with        { tk TWith }
-  let         { tk TLet }
-  in          { tk TIn }
-  rec         { tk TRec }
-  inherit     { tk TInherit }
-  or          { tk TOrKW }
-  \.\.\.      { tk TEllipsis }
+  <0>if          { tk TIf }
+  <0>then        { tk TThen }
+  <0>else        { tk TElse }
+  <0>assert      { tk TAssert }
+  <0>with        { tk TWith }
+  <0>let         { tk TLet }
+  <0>in          { tk TIn }
+  <0>rec         { tk TRec }
+  <0>inherit     { tk TInherit }
+  <0>or          { tk TOrKW }
+  <0>\.\.\.      { tk TEllipsis }
 
-  \=\=        { tk TEq }
-  \!\=        { tk TNeq }
-  \<\=        { tk TLeq }
-  \>\=        { tk TGeq }
-  \&\&        { tk TAnd }
-  \|\|        { tk TOr }
-  \-\>        { tk TImpl }
-  \/\/        { tk TUpdate }
-  \+\+        { tk TConcat }
+  <0>\=\=        { tk TEq }
+  <0>\!\=        { tk TNeq }
+  <0>\<\=        { tk TLeq }
+  <0>\>\=        { tk TGeq }
+  <0>\&\&        { tk TAnd }
+  <0>\|\|        { tk TOr }
+  <0>\-\>        { tk TImpl }
+  <0>\/\/        { tk TUpdate }
+  <0>\+\+        { tk TConcat }
 
-  @id    { text TId }
+  <0>@id    { text TId }
 
-  @int   { \txt s -> (TInt . read . T.unpack $ txt, s) }
-  @float { \txt s -> (TFloat . read . fixup . T.unpack $ txt, s)
-                 -- In Haskell, `read ".5"` throws
-           where fixup ('.':rest) = "0." <> rest
-                 fixup xs = xs
-         }
+  <0>@int   { \txt s -> (TInt . read . T.unpack $ txt, s) }
+  <0>@float { \txt s -> (TFloat . read . fixup . T.unpack $ txt, s)
+                    -- In Haskell, `read ".5"` throws
+              where fixup ('.':rest) = "0." <> rest
+                    fixup xs = xs
+            }
 
   -- TODO antiquotation
 
   <0>\" { char '"' & push str }
   <str>([^ \" \\]
        |\\ @any)+ { text TStr . unescape }
-  <str>\"         { char '"' & pop }
   <str>\\         { const $ text TStr "\\" }
+  <str>\"         { char '"' & pop }
 
   <0>\'\'(\ *\n)? { tk TIndStrOpen & push indStr }
-  <indStr>([^\']
-          | \' [^\'])+ { text TIndStr }
-  <indStr>\'\'\\@any   { text TIndStr . unescape . T.drop 2 }
-  <indStr>\'\'\'       { const $ text TIndStr "''" }
-  <indStr>\'\'         { tk TIndStrClose & pop }
-  <indStr>\'           { const $ text TIndStr "'" }
+  <indStr>(~\'
+          |\' ~\')+  { text TIndStr }
+  <indStr>\'\'\\@any { text TIndStr . unescape . T.drop 2 }
+  <indStr>\'\'\'     { const $ text TIndStr "''" }
+  <indStr>\'\'       { tk TIndStrClose & pop }
+  <indStr>\'         { const $ text TIndStr "'" }
 
-  @path  { text TPath }
+  <0>@path  { text TPath }
                    -- drop leading ~
-  @hpath { \txt -> text THPath (T.tail txt) }
+  <0>@hpath { text THPath . T.tail }
                    -- drop leading < and trailing >
-  @spath { \txt -> text TSPath (T.init . T.tail $ txt) }
-  @uri   { text TUri }
+  <0>@spath { text TSPath . T.init . T.tail }
+  <0>@uri   { text TUri }
 
-  [\ \t\r\n]+ ; -- eat up whitespace
-  \# [^\r\n]* ; -- single-line comments
-  \/ \* ([^\*] | \*+ [^\*\/])* \*+ \/ ; -- long comments
+  <0>[\ \t\r\n]+ ; -- eat up whitespace
+  <0>\# [^\r\n]* ; -- single-line comments
+  <0>\/ \* ([^\*] | \*+ [^\*\/])* \*+ \/ ; -- long comments
 
-  @any   { \txt s -> (TChar $ T.head txt, s) }
+  <0>@any   { \txt s -> char (T.head txt) txt s }
 
 {
 -- Helper token data types
