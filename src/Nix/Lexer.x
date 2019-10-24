@@ -33,13 +33,13 @@ import           Data.Word (Word8)
 
 %action "AlexAction"
 
+$any  = [. \n]
 $alf  = [a-zA-Z]
 $num  = [0-9]
 $id0  = [$alf \_]
 $id   = [$id0 $num \'\-]
 $pseg = [$alf $num \.\_\-\+]
 
-@any   = . | \n
 @id    = $id0 $id*
 @int   = $num+
 @float =
@@ -89,14 +89,14 @@ tokens :-
 
   <0>\" { char '"' & push str }
   <str>([^ \" \\]
-       |\\ @any)+ { text TStr . unescape }
+       |\\ $any)+ { text TStr . unescape }
   <str>\\         { const $ text TStr "\\" }
   <str>\"         { char '"' & pop }
 
-  <0>\'\'(\ *\n)? { tk TIndStrOpen & push indStr }
-  <indStr>(~\'
-          |\' ~\')+  { text TIndStr }
-  <indStr>\'\'\\@any { text TIndStr . unescape . T.drop 2 }
+  <0>\'\'(\ *\n?)? { tk TIndStrOpen & push indStr }
+  <indStr>($any#\'
+          |\' $any#\')+  { text TIndStr }
+  <indStr>\'\'\\$any { text TIndStr . unescape . T.drop 2 }
   <indStr>\'\'\'     { const $ text TIndStr "''" }
   <indStr>\'\'       { tk TIndStrClose & pop }
   <indStr>\'         { const $ text TIndStr "'" }
@@ -112,7 +112,7 @@ tokens :-
   <0>\# [^\r\n]* ; -- single-line comments
   <0>\/ \* ([^\*] | \*+ [^\*\/])* \*+ \/ ; -- long comments
 
-  <0>@any   { \txt s -> char (T.head txt) txt s }
+  <0>$any   { \txt s -> char (T.head txt) txt s }
 
 {
 -- Helper token data types

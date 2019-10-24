@@ -19,14 +19,32 @@ case_constant = do
   assertLex "false" [TText TId "false"]
   assertLex "true-foo" [TText TId "true-foo"]
   assertLex "false-bar" [TText TId "false-bar"]
-  assertLex "./. ./+-_/cdef/09ad+- /abc ../abc <abc> <../cdef>"
+  assertLex "./. ./+-_/cdef/09ad+- /abc ../abc <abc> <../cdef> a//b rec+def/cdef"
           [ TText TPath "./."
           , TText TPath "./+-_/cdef/09ad+-"
           , TText TPath "/abc"
           , TText TPath "../abc"
           , TText TSPath "abc"
           , TText TSPath "../cdef"
+          , TText TId "a", TTk TUpdate, TText TId "b"
+          , TText TPath "rec+def/cdef"
           ]
+  -- assertParseText "a'b/c" $ Fix $ NBinary NApp (mkSym "a'b") (mkPath False "/c")
+  -- But meanwhile...
+  -- nix-repl> a/b//c/def//<g> < def/d
+  -- error: path 'a/b/' has a trailing slash
+  -- So, I need to throw error from lexer?
+  assertLex "a'b/c a/b 4/2"
+    [ TText TId "a'b"
+    , TText TPath "/c"
+    , TText TPath "a/b"
+    , TText TPath "4/2" ]
+  assertLex "a:a http://foo.bar a+de+.adA+-:%%%ads%5asdk&/ rec+def:c"
+    [ TText TUri "a:a"
+    , TText TUri "http://foo.bar"
+    , TText TUri "a+de+.adA+-:%%%ads%5asdk&/"
+    , TText TUri "rec+def:c" ]
+
 
 case_simple_let = do
   assertLex "let a = 4; in a"
@@ -49,9 +67,15 @@ case_string_escape = do
   assertLex "\"\\n\\t\\\\\"" [TChar '"', TText TStr "\n\t\\", TChar '"']
   assertLex "\" \\\" \\' \"" [TChar '"', TText TStr " \" ' ", TChar '"']
 
+case_indented_string = do
+  assertLex "''a''" [TTk TIndStrOpen, TText TIndStr "a", TTk TIndStrClose]
+  assertLex "''\n  foo\n  bar''" [TTk TIndStrOpen, TText TIndStr "  foo\n  bar", TTk TIndStrClose]
+  assertLex "''        ''" [TTk TIndStrOpen, TTk TIndStrClose]
+  assertLex "'''''''" [TTk TIndStrOpen, TText TIndStr "''", TTk TIndStrClose]
+
 case_indented_string_escape = do
   assertLex "'' ''\\n ''\\t ''\\\\ \\ \\n ' ''' ''"
-    [ TTk TIndStrOpen , TText TIndStr " ", TText TIndStr "\n", TText TIndStr " "
+    [ TTk TIndStrOpen, TText TIndStr "\n", TText TIndStr " "
     , TText TIndStr "\t", TText TIndStr " ", TText TIndStr "\\"
     , TText TIndStr " \\ \\n ' ", TText TIndStr "''", TText TIndStr " "
     , TTk TIndStrClose ]
