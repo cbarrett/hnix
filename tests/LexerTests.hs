@@ -29,11 +29,11 @@ case_constant = do
           , TText TId "a", TTk TUpdate, TText TId "b"
           , TText TPath "rec+def/cdef"
           ]
-  -- assertParseText "a'b/c" $ Fix $ NBinary NApp (mkSym "a'b") (mkPath False "/c")
+  -- assertParseText "a/b//c/def//<g> < def/d" $ ...
   -- But meanwhile...
   -- nix-repl> a/b//c/def//<g> < def/d
   -- error: path 'a/b/' has a trailing slash
-  -- So, I need to throw error from lexer?
+  -- So, do I need to throw error from lexer? Or what?
   assertLex "a'b/c a/b 4/2"
     [ TText TId "a'b"
     , TText TPath "/c"
