@@ -1,21 +1,22 @@
 module ParserBench (benchmarks) where
 
+import           Nix.Prelude
 import           Nix.Parser
 
-import           Control.Applicative
 import           Criterion
 
-benchFile :: FilePath -> Benchmark
-benchFile = bench <*> whnfIO . parseNixFile . ("data/" ++)
+benchFile :: Path -> Benchmark
+benchFile = bench . coerce <*> whnfIO . parseNixFile . ("data/" <>)
 
 benchmarks :: Benchmark
 benchmarks = bgroup
-  "Parser"
-  [ benchFile "nixpkgs-all-packages.nix"
-  , benchFile "nixpkgs-all-packages-pretty.nix"
-  , benchFile "let-comments.nix"
-  , benchFile "let-comments-multiline.nix"
-  , benchFile "let.nix"
-  , benchFile "simple.nix"
-  , benchFile "simple-pretty.nix"
-  ]
+  "Parser" $
+    fmap benchFile
+      [ "nixpkgs-all-packages.nix"
+      , "nixpkgs-all-packages-pretty.nix"
+      , "let-comments.nix"
+      , "let-comments-multiline.nix"
+      , "let.nix"
+      , "simple.nix"
+      , "simple-pretty.nix"
+      ]

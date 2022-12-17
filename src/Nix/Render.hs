@@ -1,125 +1,141 @@
-{-# LANGUAGE ConstraintKinds #-}
-{-# LANGUAGE DefaultSignatures #-}
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE GADTs #-}
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE TypeFamilies #-}
-{-# LANGUAGE TypeOperators #-}
-{-# LANGUAGE ViewPatterns #-}
+{-# language UndecidableInstances #-}
+{-# language CPP #-}
+{-# language ConstraintKinds #-}
+{-# language DefaultSignatures #-}
+{-# language TypeFamilies #-}
+{-# language TypeOperators #-}
+{-# language MultiWayIf #-}
 
 module Nix.Render where
 
-import           Prelude                 hiding ( readFile )
-
-import           Control.Monad.Trans
-import           Data.ByteString                ( ByteString )
-import qualified Data.ByteString               as BS
+import           Nix.Prelude
 import qualified Data.Set                      as Set
-import qualified Data.Text                     as T
-import qualified Data.Text.Encoding            as T
-import           Data.Text.Prettyprint.Doc
-import           Data.Void
+import           Nix.Utils.Fix1                 ( Fix1T
+                                                , MonadFix1T
+                                                )
+import           Nix.Expr.Types                 ( NPos(..)
+                                                , NSourcePos(..)
+                                                )
 import           Nix.Expr.Types.Annotated
+import           Prettyprinter
 import qualified System.Directory              as S
-import qualified System.Posix.Files            as S
+import qualified System.PosixCompat.Files      as S
 import           Text.Megaparsec.Error
 import           Text.Megaparsec.Pos
+import qualified Data.Text                     as Text
 
-class Monad m => MonadFile m where
-    readFile :: FilePath -> m ByteString
-    default readFile :: (MonadTrans t, MonadFile m', m ~ t m') => FilePath -> m ByteString
-    readFile = lift . readFile
-    listDirectory :: FilePath -> m [FilePath]
-    default listDirectory :: (MonadTrans t, MonadFile m', m ~ t m') => FilePath -> m [FilePath]
+class (MonadFail m, MonadIO m) => MonadFile m where
+    readFile :: Path -> m Text
+    default readFile :: (MonadTrans t, MonadIO m', MonadFile m', m ~ t m') => Path -> m Text
+    readFile = liftIO . Nix.Prelude.readFile
+    listDirectory :: Path -> m [Path]
+    default listDirectory :: (MonadTrans t, MonadFile m', m ~ t m') => Path -> m [Path]
     listDirectory = lift . listDirectory
-    getCurrentDirectory :: m FilePath
-    default getCurrentDirectory :: (MonadTrans t, MonadFile m', m ~ t m') => m FilePath
+    getCurrentDirectory :: m Path
+    default getCurrentDirectory :: (MonadTrans t, MonadFile m', m ~ t m') => m Path
     getCurrentDirectory = lift getCurrentDirectory
-    canonicalizePath :: FilePath -> m FilePath
-    default canonicalizePath :: (MonadTrans t, MonadFile m', m ~ t m') => FilePath -> m FilePath
+    canonicalizePath :: Path -> m Path
+    default canonicalizePath :: (MonadTrans t, MonadFile m', m ~ t m') => Path -> m Path
     canonicalizePath = lift . canonicalizePath
-    getHomeDirectory :: m FilePath
-    default getHomeDirectory :: (MonadTrans t, MonadFile m', m ~ t m') => m FilePath
+    getHomeDirectory :: m Path
+    default getHomeDirectory :: (MonadTrans t, MonadFile m', m ~ t m') => m Path
     getHomeDirectory = lift getHomeDirectory
-    doesPathExist :: FilePath -> m Bool
-    default doesPathExist :: (MonadTrans t, MonadFile m', m ~ t m') => FilePath -> m Bool
+    doesPathExist :: Path -> m Bool
+    default doesPathExist :: (MonadTrans t, MonadFile m', m ~ t m') => Path -> m Bool
     doesPathExist = lift . doesPathExist
-    doesFileExist :: FilePath -> m Bool
-    default doesFileExist :: (MonadTrans t, MonadFile m', m ~ t m') => FilePath -> m Bool
+    doesFileExist :: Path -> m Bool
+    default doesFileExist :: (MonadTrans t, MonadFile m', m ~ t m') => Path -> m Bool
     doesFileExist = lift . doesFileExist
-    doesDirectoryExist :: FilePath -> m Bool
-    default doesDirectoryExist :: (MonadTrans t, MonadFile m', m ~ t m') => FilePath -> m Bool
+    doesDirectoryExist :: Path -> m Bool
+    default doesDirectoryExist :: (MonadTrans t, MonadFile m', m ~ t m') => Path -> m Bool
     doesDirectoryExist = lift . doesDirectoryExist
-    getSymbolicLinkStatus :: FilePath -> m S.FileStatus
-    default getSymbolicLinkStatus :: (MonadTrans t, MonadFile m', m ~ t m') => FilePath -> m S.FileStatus
+    getSymbolicLinkStatus :: Path -> m S.FileStatus
+    default getSymbolicLinkStatus :: (MonadTrans t, MonadFile m', m ~ t m') => Path -> m S.FileStatus
     getSymbolicLinkStatus = lift . getSymbolicLinkStatus
 
 instance MonadFile IO where
-  readFile              = BS.readFile
-  listDirectory         = S.listDirectory
-  getCurrentDirectory   = S.getCurrentDirectory
-  canonicalizePath      = S.canonicalizePath
-  getHomeDirectory      = S.getHomeDirectory
-  doesPathExist         = S.doesPathExist
-  doesFileExist         = S.doesFileExist
-  doesDirectoryExist    = S.doesDirectoryExist
-  getSymbolicLinkStatus = S.getSymbolicLinkStatus
+  readFile              = Nix.Prelude.readFile
+  listDirectory         = coerce S.listDirectory
+  getCurrentDirectory   = coerce S.getCurrentDirectory
+  canonicalizePath      = coerce S.canonicalizePath
+  getHomeDirectory      = coerce S.getHomeDirectory
+  doesPathExist         = coerce S.doesPathExist
+  doesFileExist         = coerce S.doesFileExist
+  doesDirectoryExist    = coerce S.doesDirectoryExist
+  getSymbolicLinkStatus = coerce S.getSymbolicLinkStatus
 
-posAndMsg :: SourcePos -> Doc a -> ParseError s Void
-posAndMsg (SourcePos _ lineNo _) msg = FancyError
-  (unPos lineNo)
-  (Set.fromList [ErrorFail (show msg) :: ErrorFancy Void])
+
+instance (MonadFix1T t m, MonadIO (Fix1T t m), MonadFail (Fix1T t m), MonadFile m) => MonadFile (Fix1T t m)
+
+posAndMsg :: NSourcePos -> Doc a -> ParseError s Void
+posAndMsg (NSourcePos _ (coerce -> lineNo) _) msg =
+  FancyError
+    (unPos lineNo)
+    (Set.fromList $ one (ErrorFail (show msg) :: ErrorFancy Void))
 
 renderLocation :: MonadFile m => SrcSpan -> Doc a -> m (Doc a)
-renderLocation (SrcSpan (SourcePos file begLine begCol) (SourcePos file' endLine endCol)) msg
-  | file /= "<string>" && file == file'
-  = do
-    exist <- doesFileExist file
-    if exist
-      then do
-        txt <- sourceContext file begLine begCol endLine endCol msg
-        return
-          $ vsep
-              [ "In file "
-              <> errorContext file begLine begCol endLine endCol
-              <> ":"
-              , txt
-              ]
-      else return msg
-renderLocation (SrcSpan beg end) msg =
-  fail
-    $  "Don't know how to render range from "
-    ++ show beg
-    ++ " to "
-    ++ show end
-    ++ " for error: "
-    ++ show msg
+renderLocation (SrcSpan (NSourcePos file (coerce -> begLine) (coerce -> begCol)) (NSourcePos file' (coerce -> endLine) (coerce -> endCol))) msg
+  | file == file' && file == "<string>" && begLine == endLine =
+    pure $ "In raw input string at position " <> pretty (unPos begCol)
 
-errorContext :: FilePath -> Pos -> Pos -> Pos -> Pos -> Doc a
-errorContext path bl bc _el _ec =
+  | file /= "<string>" && file == file' =
+    bool
+      (pure msg)
+      (do
+        txt <- sourceContext file begLine begCol endLine endCol msg
+        pure $
+          vsep
+            [ "In file " <> errorContext file begLine begCol endLine endCol <> ":"
+            , txt
+            ]
+      )
+      =<< doesFileExist file
+renderLocation (SrcSpan beg end) msg = fail $ "Don't know how to render range from " <> show beg <>" to " <> show end <>" for fail: " <> show msg
+
+errorContext :: Path -> Pos -> Pos -> Pos -> Pos -> Doc a
+errorContext (coerce @Path @FilePath -> path) bl bc _el _ec =
   pretty path <> ":" <> pretty (unPos bl) <> ":" <> pretty (unPos bc)
 
 sourceContext
-  :: MonadFile m => FilePath -> Pos -> Pos -> Pos -> Pos -> Doc a -> m (Doc a)
+  :: MonadFile m => Path -> Pos -> Pos -> Pos -> Pos -> Doc a -> m (Doc a)
 sourceContext path (unPos -> begLine) (unPos -> _begCol) (unPos -> endLine) (unPos -> _endCol) msg
   = do
-    let beg' = max 1 (min begLine (begLine - 3))
-        end' = max endLine (endLine + 3)
+    let beg' = max 1 $ begLine - 3
+        end' =         endLine + 3
     ls <-
-      map pretty
+      fmap pretty
       .   take (end' - beg')
       .   drop (pred beg')
-      .   T.lines
-      .   T.decodeUtf8
-      <$> readFile path
+      .   lines
+      <$> Nix.Render.readFile path
     let
-      nums    = map (show . fst) $ zip [beg' ..] ls
-      longest = maximum (map length nums)
-      nums'   = flip map nums $ \n -> replicate (longest - length n) ' ' ++ n
-      pad n | read n == begLine = "==> " ++ n
-            | otherwise         = "    " ++ n
-      ls' = zipWith (<+>)
-                    (map (pretty . pad) nums')
-                    (zipWith (<+>) (repeat "| ") ls)
-    pure $ vsep $ ls' ++ [msg]
+      longest = Text.length $ show $ beg' + length ls - 1
+      pad :: Int -> Text
+      pad n =
+        let
+          ns :: Text
+          ns = show n
+          nsp = Text.replicate (longest - Text.length ns) " " <> ns
+        in
+          if
+          | n == begLine && n == endLine -> "==> " <> nsp <> " |  "
+          | n >= begLine && n <= endLine -> "  > " <> nsp <> " |  "
+          | otherwise                    -> "    " <> nsp <> " |  "
+      composeLine n l =
+        one (pretty (pad n) <> l)
+        <> whenTrue
+            (one $
+              pretty $
+                Text.replicate (Text.length (pad n) - 3) " "
+                <> "|"
+                <> Text.replicate (_begCol + 1) " "
+                <> Text.replicate (_endCol - _begCol) "^"
+            )
+            (begLine == endLine && n == endLine)
+        -- XXX: Consider inserting the message here when it is small enough.
+        -- ATM some messages are so huge that they take prevalence over the source listing.
+        -- ++ [ indent (length $ pad n) msg | n == endLine ]
+
+      ls' = fold $ zipWith composeLine [beg' ..] ls
+
+    pure $ vsep $ ls' <> one (indent (Text.length $ pad begLine) msg)

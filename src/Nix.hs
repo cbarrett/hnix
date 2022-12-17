@@ -1,13 +1,9 @@
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE ViewPatterns #-}
-
 module Nix
   ( module Nix.Cache
   , module Nix.Exec
-  , module Nix.Expr
+  , module Nix.Expr.Types
+  , module Nix.Expr.Shorthands
+  , module Nix.Expr.Types.Annotated
   , module Nix.Frames
   , module Nix.Render.Frame
   , module Nix.Normal
@@ -28,10 +24,10 @@ module Nix
   )
 where
 
-import           Control.Applicative
-import           Control.Arrow                  ( second )
-import           Control.Monad.Reader
-import           Data.Fix
+import           Nix.Prelude
+import           Relude.Unsafe                  ( (!!) )
+import           GHC.Err                        ( errorWithoutStackTrace )
+import           Data.Fix                       ( Fix )
 import qualified Data.HashMap.Lazy             as M
 import qualified Data.Text                     as Text
 import qualified Data.Text.Read                as Text
@@ -39,7 +35,9 @@ import           Nix.Builtins
 import           Nix.Cache
 import qualified Nix.Eval                      as Eval
 import           Nix.Exec
-import           Nix.Expr
+import           Nix.Expr.Types
+import           Nix.Expr.Shorthands
+import           Nix.Expr.Types.Annotated
 import           Nix.Frames
 import           Nix.String
 import           Nix.Normal
@@ -49,7 +47,6 @@ import           Nix.Pretty
 import           Nix.Reduce
 import           Nix.Render.Frame
 import           Nix.Thunk
-import           Nix.Utils
 import           Nix.Value
 import           Nix.Value.Monad
 import           Nix.XML
@@ -59,32 +56,32 @@ import           Nix.XML
 --   transformations, allowing them to be easily composed.
 nixEval
   :: (MonadNix e t f m, Has e Options, Functor g)
-  => Maybe FilePath
-  -> Transform g (m a)
+  => Transform g (m a)
   -> Alg g (m a)
+  -> Maybe Path
   -> Fix g
   -> m a
-nixEval mpath xform alg = withNixContext mpath . adi alg xform
+nixEval transform alg mpath = withNixContext mpath . adi transform alg
 
 -- | Evaluate a nix expression in the default context
 nixEvalExpr
   :: (MonadNix e t f m, Has e Options)
-  => Maybe FilePath
+  => Maybe Path
   -> NExpr
   -> m (NValue t f m)
-nixEvalExpr mpath = nixEval mpath id Eval.eval
+nixEvalExpr = nixEval id Eval.eval
 
 -- | Evaluate a nix expression in the default context
 nixEvalExprLoc
   :: forall e t f m
    . (MonadNix e t f m, Has e Options)
-  => Maybe FilePath
+  => Maybe Path
   -> NExprLoc
   -> m (NValue t f m)
-nixEvalExprLoc mpath = nixEval
-  mpath
-  (Eval.addStackFrames . Eval.addSourcePositions)
-  (Eval.eval . annotated . getCompose)
+nixEvalExprLoc =
+  nixEval
+    Eval.addMetaInfo
+    Eval.evalContent
 
 -- | Evaluate a nix expression with tracing in the default context. Note that
 --   this function doesn't do any tracing itself, but 'evalExprLoc' will be
@@ -93,37 +90,41 @@ nixEvalExprLoc mpath = nixEval
 --   context.
 nixTracingEvalExprLoc
   :: (MonadNix e t f m, Has e Options, MonadIO m, Alternative m)
-  => Maybe FilePath
+  => Maybe Path
   -> NExprLoc
   -> m (NValue t f m)
 nixTracingEvalExprLoc mpath = withNixContext mpath . evalExprLoc
 
 evaluateExpression
   :: (MonadNix e t f m, Has e Options)
-  => Maybe FilePath
-  -> (Maybe FilePath -> NExprLoc -> m (NValue t f m))
+  => Maybe Path
+  -> (Maybe Path -> NExprLoc -> m (NValue t f m))
   -> (NValue t f m -> m a)
   -> NExprLoc
   -> m a
-evaluateExpression mpath evaluator handler expr = do
-  opts :: Options <- asks (view hasLens)
-  args <- traverse (traverse eval') $ map (second parseArg) (arg opts) ++ map
-    (second mkStr)
-    (argstr opts)
-  compute evaluator expr (argmap args) handler
+evaluateExpression mpath evaluator handler expr =
+  do
+    opts <- askOptions
+    (coerce -> args) <-
+      (traverse . traverse)
+        eval'
+        $  (second parseArg <$> getArg    opts)
+        <> (second mkStr    <$> getArgstr opts)
+    f <- evaluator mpath expr
+    f' <- demand f
+    val <-
+      case f' of
+        NVClosure _ g -> g $ NVSet mempty $ M.fromList args
+        _             -> pure f
+    processResult handler val
  where
-  parseArg s = case parseNixText s of
-    Success x   -> x
-    Failure err -> errorWithoutStackTrace (show err)
+  parseArg s =
+    either
+      (errorWithoutStackTrace . show)
+      id
+      (parseNixText s)
 
-  eval' = (normalForm =<<) . nixEvalExpr mpath
-
-  argmap args = nvSet (M.fromList args) mempty
-
-  compute ev x args p = ev mpath x >>= \f -> demand f $ \f' ->
-    processResult p =<< case f' of
-      NVClosure _ g -> g args
-      _             -> pure f
+  eval' = normalForm <=< nixEvalExpr mpath
 
 processResult
   :: forall e t f m a
@@ -131,37 +132,28 @@ processResult
   => (NValue t f m -> m a)
   -> NValue t f m
   -> m a
-processResult h val = do
-  opts :: Options <- asks (view hasLens)
-  case attr opts of
-    Nothing                         -> h val
-    Just (Text.splitOn "." -> keys) -> go keys val
+processResult h val =
+  do
+    opts <- askOptions
+    maybe
+      (h val)
+      (\ (coerce . Text.splitOn "." -> keys) -> processKeys keys val)
+      (getAttr opts)
  where
-  go :: [Text.Text] -> NValue t f m -> m a
-  go [] v = h v
-  go ((Text.decimal -> Right (n,"")) : ks) v = demand v $ \case
-    NVList xs -> case ks of
-      [] -> h (xs !! n)
-      _  -> go ks (xs !! n)
-    _ ->
-      errorWithoutStackTrace
-        $  "Expected a list for selector '"
-        ++ show n
-        ++ "', but got: "
-        ++ show v
-  go (k : ks) v = demand v $ \case
-    NVSet xs _ -> case M.lookup k xs of
-      Nothing ->
-        errorWithoutStackTrace
-          $  "Set does not contain key '"
-          ++ Text.unpack k
-          ++ "'"
-      Just v' -> case ks of
-        [] -> h v'
-        _  -> go ks v'
-    _ ->
-      errorWithoutStackTrace
-        $  "Expected a set for selector '"
-        ++ Text.unpack k
-        ++ "', but got: "
-        ++ show v
+  processKeys :: [VarName] -> NValue t f m -> m a
+  processKeys kys v =
+    handlePresence
+      (h v)
+      (\ ((k : ks) :: [VarName]) ->
+        do
+          v' <- demand v
+          case (k, v') of
+            (Text.decimal . coerce -> Right (n,""), NVList xs) -> processKeys ks $ xs !! n
+            (_,         NVSet _ xs) ->
+              maybe
+                (errorWithoutStackTrace $ "Set does not contain key ''" <> show k <> "''.")
+                (processKeys ks)
+                (M.lookup k xs)
+            (_, _) -> errorWithoutStackTrace $ "Expected a set or list for selector '" <> show k <> "', but got: " <> show v
+      )
+      kys

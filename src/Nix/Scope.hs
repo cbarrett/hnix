@@ -1,98 +1,141 @@
-{-# LANGUAGE AllowAmbiguousTypes #-}
-{-# LANGUAGE ConstraintKinds #-}
-{-# LANGUAGE DeriveFoldable #-}
-{-# LANGUAGE DeriveFunctor #-}
-{-# LANGUAGE DeriveTraversable #-}
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE FlexibleInstances #-}
-{-# LANGUAGE FunctionalDependencies #-}
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
-{-# LANGUAGE MultiParamTypeClasses #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE TypeApplications #-}
+{-# language UndecidableInstances #-}
+{-# language AllowAmbiguousTypes #-}
+{-# language ConstraintKinds #-}
+{-# language FunctionalDependencies #-}
+{-# language GeneralizedNewtypeDeriving #-}
 
 module Nix.Scope where
 
-import           Control.Applicative
-import           Control.Monad.Reader
+import           Nix.Prelude
 import qualified Data.HashMap.Lazy             as M
-import           Data.Text                      ( Text )
+import qualified Text.Show
 import           Lens.Family2
-import           Nix.Utils
+import           Nix.Expr.Types
 
-newtype Scope a = Scope { getScope :: AttrSet a }
-    deriving (Functor, Foldable, Traversable, Eq)
+--  2021-07-19: NOTE: Scopes can gain from sequentiality, HashMap (aka AttrSet) may not be proper to it.
+newtype Scope a = Scope (AttrSet a)
+  deriving
+    ( Eq, Ord, Generic
+    , Typeable, NFData
+    , Read, Hashable
+    , Semigroup, Monoid
+    , Functor, Foldable, Traversable
+    , One
+    )
 
 instance Show (Scope a) where
-  show (Scope m) = show (M.keys m)
+  show (Scope m) = show $ M.keys m
 
-newScope :: AttrSet a -> Scope a
-newScope = Scope
+scopeLookup :: VarName -> [Scope a] -> Maybe a
+scopeLookup key = foldr fun Nothing
+ where
+  fun
+    :: Scope a
+    -> Maybe a
+    -> Maybe a
+  fun (Scope m) rest = M.lookup key m <|> rest
 
-scopeLookup :: Text -> [Scope a] -> Maybe a
-scopeLookup key = foldr go Nothing
-  where go (Scope m) rest = M.lookup key m <|> rest
-
-data Scopes m a = Scopes
+data Scopes m a =
+  Scopes
     { lexicalScopes :: [Scope a]
     , dynamicScopes :: [m (Scope a)]
     }
 
 instance Show (Scopes m a) where
   show (Scopes m a) =
-    "Scopes: " ++ show m ++ ", and " ++ show (length a) ++ " with-scopes"
+    "Scopes: " <> show m <> ", and " <> show (length a) <> " with-scopes"
 
 instance Semigroup (Scopes m a) where
   Scopes ls lw <> Scopes rs rw = Scopes (ls <> rs) (lw <> rw)
 
 instance Monoid (Scopes m a) where
-  mempty  = emptyScopes
-  mappend = (<>)
+  mempty = emptyScopes
 
-emptyScopes :: forall m a . Scopes m a
-emptyScopes = Scopes [] []
+emptyScopes :: Scopes m a
+emptyScopes = Scopes mempty mempty
 
 class Scoped a m | m -> a where
-  currentScopes :: m (Scopes m a)
-  clearScopes :: m r -> m r
-  pushScopes :: Scopes m a -> m r -> m r
-  lookupVar :: Text -> m (Maybe a)
+  askScopes :: m (Scopes m a)
+  clearScopes   :: m r -> m r
+  pushScopes    :: Scopes m a -> m r -> m r
+  lookupVar     :: VarName -> m (Maybe a)
 
-currentScopesReader
-  :: forall m a e . (MonadReader e m, Has e (Scopes m a)) => m (Scopes m a)
-currentScopesReader = asks (view hasLens)
+askScopesReader
+  :: forall m a e
+  . ( MonadReader e m
+    , Has e (Scopes m a)
+    )
+  => m (Scopes m a)
+askScopesReader = askLocal
 
 clearScopesReader
-  :: forall m a e r . (MonadReader e m, Has e (Scopes m a)) => m r -> m r
-clearScopesReader = local (set hasLens (emptyScopes @m @a))
+  :: forall m a e r
+  . ( MonadReader e m
+    , Has e (Scopes m a)
+    )
+  => m r
+  -> m r
+clearScopesReader = local $ set hasLens $ emptyScopes @m @a
 
-pushScope :: Scoped a m => AttrSet a -> m r -> m r
-pushScope s = pushScopes (Scopes [Scope s] [])
+pushScope
+  :: Scoped a m
+  => Scope a
+  -> m r
+  -> m r
+pushScope scope = pushScopes $ Scopes (one scope) mempty
 
-pushWeakScope :: (Functor m, Scoped a m) => m (AttrSet a) -> m r -> m r
-pushWeakScope s = pushScopes (Scopes [] [Scope <$> s])
+pushWeakScope
+  :: ( Functor m
+     , Scoped a m
+     )
+  => m (Scope a)
+  -> m r
+  -> m r
+pushWeakScope scope = pushScopes $ Scopes mempty $ one scope
 
 pushScopesReader
-  :: (MonadReader e m, Has e (Scopes m a)) => Scopes m a -> m r -> m r
-pushScopesReader s = local (over hasLens (s <>))
+  :: ( MonadReader e m
+     , Has e (Scopes m a)
+     )
+  => Scopes m a
+  -> m r
+  -> m r
+pushScopesReader s = local $ over hasLens (s <>)
 
 lookupVarReader
-  :: forall m a e . (MonadReader e m, Has e (Scopes m a)) => Text -> m (Maybe a)
-lookupVarReader k = do
-  mres <- asks (scopeLookup k . lexicalScopes @m . view hasLens)
-  case mres of
-    Just sym -> return $ Just sym
-    Nothing  -> do
-      ws <- asks (dynamicScopes . view hasLens)
-      foldr
-        (\x rest -> do
-          mres' <- M.lookup k . getScope <$> x
-          case mres' of
-            Just sym -> return $ Just sym
-            Nothing  -> rest
-        )
-        (return Nothing)
-        ws
+  :: forall m a e
+  . ( MonadReader e m
+    , Has e (Scopes m a)
+    )
+  => VarName
+  -> m (Maybe a)
+lookupVarReader k =
+  do
+    mres <- asks $ scopeLookup k . lexicalScopes @m . view hasLens
 
-withScopes :: Scoped a m => Scopes m a -> m r -> m r
-withScopes scope = clearScopes . pushScopes scope
+    maybe
+      (do
+        ws <- asks $ dynamicScopes . view hasLens
+
+        foldr
+          (\ weakscope rest ->
+            do
+              mres' <- M.lookup k . coerce @(Scope a) <$> weakscope
+
+              maybe
+                rest
+                (pure . pure)
+                mres'
+          )
+          (pure Nothing)
+          ws
+      )
+      (pure . pure)
+      mres
+
+withScopes
+  :: Scoped a m
+  => Scopes m a
+  -> m r
+  -> m r
+withScopes scopes = clearScopes . pushScopes scopes

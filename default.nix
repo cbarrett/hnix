@@ -1,129 +1,213 @@
-{ compiler ? "ghc864"
+{
+# For current default and explicitly supported GHCs https://search.nixos.org/packages?query=ghc&from=0&size=500&channel=unstable, Nixpkgs implicitly supports older minor versions also, until the configuration departs from compatibility with them.
+# Compiler in a form ghc8101 <- GHC 8.10.1, just remove spaces and dots
+  compiler    ? "ghc8107"
 
-, doBenchmark ? false
+# Deafult.nix is a unit package abstraciton that allows to abstract over packages even in monorepos:
+# Example: pass --arg cabalName --arg packageRoot "./subprojectDir", or map default.nix over a list of tiples for subprojects.
+# cabalName is package resulting name: by default and on error resolves in haskellPackages.developPackage to project root directory name by default, but outside the haskellPackages.developPackage as you see below packageRoot can be different
+, cabalName ? "hnix"
+, packageRoot ? pkgs.nix-gitignore.gitignoreSource [ ] ./.
+
+# This settings expose most of the Nixpkgs Haskell.lib API: https://github.com/NixOS/nixpkgs/blob/master/pkgs/development/haskell-modules/lib.nix
+
+# Some of these options implicitly enable other options they require, and some counterpoint options clash, obviously
+
+# Don't fail at configure time if there are multiple versions of the same package in the (recursive) dependencies of the package being built. Will delay failures, if any, to compile time.
+, allowInconsistentDependencies ? false
+# Escape the version bounds from the cabal file. You may want to avoid this function.
+, doJailbreak ? false
+# Nix dependency checking, compilation and execution of test suites listed in the package description file.
+, doCheck     ? true
+
+# Just produce a SDist src tarball
+, sdistTarball ? false
+# The strict packaging process as used on Hackage. Tests consistency of the Cabal file.
+, buildFromSdist ? true
+# Allow a shell environment to be requested
+, returnShellEnv ? false
+
+# Turn all warn into err with {-Wall,-Werror}
+, failOnAllWarnings ? false
+# `failOnAllWarnings` + `buildFromSdist`
+, buildStrictly ? false
+
+#  2020-06-02: NOTE: enableDeadCodeElimination = true: On GHC =< 8.8.3 macOS build falls due to https://gitlab.haskell.org/ghc/ghc/issues/17283
+, enableDeadCodeElimination ? false
+# Disabled GHC code optimizations make build/tolling/dev loops faster.
+# Works also for Haskel IDE Engine and GHCID.
+# Enable optimizations for production use, and to pass benchmarks.
+, disableOptimization ? true
+# Use faster `gold` ELF linker from GNU binutils instead of older&slower but more versatile GNU linker. Is not available by default since macOS does not have it.
+, linkWithGold ? false
+
+# Provide an inventory of performance events and timings for the execution. Provides informaiton in an absolute sense. Nothing is timestamped.
+, enableLibraryProfiling ? false
+, enableExecutableProfiling ? false
+# Include tracing information & abilities. Tracing records the chronology, often with timestamps and is extensive in time
 , doTracing   ? false
-, doOptimize  ? false # enables GHC optimizations for production use
-, doProfiling ? false # enables profiling support in GHC
-, doStrict    ? false
+# Include DWARF debugging information & abilities
+, enableDWARFDebugging ? true
+# Strip results from all debugging symbols
+, doStrip ? false
 
-, withHoogle  ? true
+# Nixpkgs expects shared libraries
+, enableSharedLibraries ? true
+# Ability to make static libraries
+, enableStaticLibraries ? false
+# Make hybrid executable that is also a shared library
+, enableSharedExecutables ? false
+# link executables statically against haskell libs to reduce closure size
+, justStaticExecutables ? false
+, enableSeparateBinOutput ? false
 
-, rev    ? "ed1b59a98e7bd61dd7eac266569c294fb6b16300"
-, sha256 ? "0b2wdbbaqdqccl7q9gskhfjk7xaqvjwcls4b6218anyc247gscnb"
+# checkUnusedPackages: is `failOnAllWarnings` + `cabal sdist` + post-build dep check.
+# Currently uses `packunused` or GHC 8.8 internals, later switches into GHC internal feature.
+# Adds a post-build check to verify that dependencies declared in the cabal file are actually used.
+, checkUnusedPackages ? false
+# Generation and installation of haddock API documentation
+, doHaddock   ? false
+#	Generate hyperlinked source code for documentation using HsColour, and have Haddock documentation link to it.
+, doHyperlinkSource ? false
+# Generation and installation of a coverage report. See https://wiki.haskell.org/Haskell_program_coverage
+, doCoverage  ? false
+# doBenchmark: Dependency checking + compilation and execution for benchmarks listed in the package description file.
+, doBenchmark ? false
+# For binaries named in `executableNamesToShellComplete` list, generate and bundle-into package an automatically loaded shell complettions
+, generateOptparseApplicativeCompletions ? false
+, executableNamesToShellComplete ? [ "hnix" ]
 
-, pkgs   ?
-    if builtins.compareVersions builtins.nixVersion "2.0" < 0
-    then abort "hnix requires at least nix 2.0"
-    else import (builtins.fetchTarball {
-           url = "https://github.com/NixOS/nixpkgs/archive/${rev}.tar.gz";
-           inherit sha256; }) {
-           config.allowUnfree = true;
-           config.allowBroken = false;
-           config.packageOverrides = pkgs: rec {
-             nix = pkgs.nixUnstable.overrideDerivation (attrs: {
-               src = if builtins.pathExists ./data/nix/version then data/nix else throw "data/nix doesn't seem to contain the nix source. You may want to run git submodule update --init.";
-               configureFlags = attrs.configureFlags ++ [ "--disable-doc-gen" ];
-               buildInputs = attrs.buildInputs ++
-                 [ pkgs.editline.dev
-                 ];
-               outputs = builtins.filter (s: s != "doc" && s != "man" ) attrs.outputs;
-             });
-           };
-         }
+
+# Include Hoogle executable and DB into derivation
+, withHoogle  ? false
+
+
+# Nix by default updates and uses locally configured nixpkgs-unstable channel
+# Nixpkgs revision options:
+#   `rev` vals in order of freshness -> cache & stability:
+#   { master
+#   , <commitHash>
+#   , haskell-updates  # Haskell development branch in Nixpkgs, can be inconsistent. Weekly merged into the upstream
+#   , nixpkgs-unstable  # Default branch on Nix installation, default for non NixOS
+#   , nixos-unstable  # nixpkgs-unstable that passes a bunch of base tests
+#   , nixos-20.03  # Last stable release, gets almost no updates to recipes, gets only required backports
+#   ...
+#   }
+, rev ? "ce6aa13369b667ac2542593170993504932eb836"
+
+, pkgs ?
+    if builtins.compareVersions builtins.nixVersion "2.0" > 0
+      then
+        if ((rev == "") || (rev == "default") || (rev == "local"))
+          then import <nixpkgs> {}
+          # Do not guard with hash, so the project is able to use current channels (rolling `rev`) of Nixpkgs
+          else import (builtins.fetchTarball "https://github.com/NixOS/nixpkgs/archive/${rev}.tar.gz") {}
+        // {
+          # Try to build dependencies even if they are marked broken.
+          # config.allowBroken = true;
+        }
+      else abort "Requires Nix >= 2.0"
 
 , mkDerivation   ? null
+, inNixShell ? false
 }:
 
 let
-  hnix-store-src = pkgs.fetchFromGitHub {
-    owner = "haskell-nix";
-    repo = "hnix-store";
-    rev = "0.1.0.0";
-    sha256 = "1z48msfkiys432rkd00fgimjgspp98dci11kgg3v8ddf4mk1s8g0";
-  };
 
-  overlay = pkgs.lib.foldr pkgs.lib.composeExtensions (_: _: {}) [
-    (import "${hnix-store-src}/overlay.nix")
-    (self: super: with pkgs.haskell.lib; {
+  hlib = pkgs.haskell.lib;
+  lib = pkgs.lib;
 
-      # Type error in the tests under ghc844 package set
-      Diff = dontCheck super.Diff;
+  getDefaultGHC = "ghc${
+      (
+        # Remove '.' from the string 8.8.4 -> 884
+        lib.stringAsChars (c: if c == "." then "" else c)
+          # Get default GHC version,
+          (lib.getVersion pkgs.haskellPackages.ghc)
+      )
+    }";
 
-      # These packages only depend on contravariant when ghc >= 8.6.3
-      # Without normalizing the dependencies, our build fails with
-      # aeson and base-compat-batteries unable to find `contravariant`
-      aeson                 = addBuildDepend super.aeson self.contravariant;
-      base-compat-batteries = addBuildDepend super.base-compat-batteries self.contravariant;
+  compilerPackage =
+    if ((compiler == "") || (compiler == "default"))
+      then getDefaultGHC
+      else compiler;
 
-      mono-traversable = dontCheck super.mono-traversable;
-      these = doJailbreak super.these;
-      multistate = doJailbreak (overrideCabal super.multistate (attrs: { broken = false; }));
-      butcher = doJailbreak (overrideCabal super.butcher (attrs: { broken = false; }));
+  haskellPackages = pkgs.haskell.packages.${compilerPackage};
 
-      brittany = doJailbreak (self.callCabal2nix "brittany"
-        (pkgs.fetchFromGitHub {
-           owner  = "lspitzner";
-           repo   = "brittany";
-           rev    = "6c187da8f8166d595f36d6aaf419370283b3d1e9";
-           sha256 = "0nmnxprbwws3w1sh63p80qj09rkrgn9888g7iim5p8611qyhdgky";
-           # date = 2018-11-30T22:13:02+01:00;
-         }) {});
-
-      ghc-exactprint = dontCheck (self.callCabal2nix "ghc-exactprint"
-        (pkgs.fetchFromGitHub {
-           owner  = "alanz";
-           repo   = "ghc-exactprint";
-           rev    = "281f65324fb1fcad8f5ceec06f5ea4c7d78cfb59";
-           sha256 = "1d6sjy5mw0jn09sgx7zn0w1gszn3mf6lzqsfv3li50fnvwv1gwzb";
-           # date = 2019-03-01T17:38:18+02:00;
-         }) {});
-    } // pkgs.lib.optionalAttrs withHoogle {
-      ghc = super.ghc // { withPackages = super.ghc.withHoogle; };
-      ghcWithPackages = self.ghc.withPackages;
-    })
-  ];
-
-  overrideHaskellPackages = orig: {
-    buildHaskellPackages =
-      orig.buildHaskellPackages.override overrideHaskellPackages;
-    overrides = if orig ? overrides
-      then pkgs.lib.composeExtensions orig.overrides overlay
-      else overlay;
-  };
-
-  haskellPackages = pkgs.haskell.packages.${compiler}.override
-    overrideHaskellPackages;
-
-in haskellPackages.developPackage {
-  name = "hnix";
-  root = ./.;
-
-  modifier = drv: pkgs.haskell.lib.overrideCabal drv (attrs: {
-    buildTools = (attrs.buildTools or []) ++ [
-      haskellPackages.cabal-install
-      haskellPackages.brittany
+  # Application of functions from this list to the package in code here happens 
+  # in the reverse order (from the tail). Some options depend on & override others, 
+  # so if enabling options caused Nix error or not expected result - change the order, 
+  # and please do not change this order without proper testing.
+  listSwitchFunc =
+    [
+      { switch = sdistTarball;                           function = hlib.sdistTarball; }
+      { switch = buildFromSdist;                         function = hlib.buildFromSdist; }
+      { switch = buildStrictly;                          function = hlib.buildStrictly; }
+      { switch = disableOptimization;                    function = hlib.disableOptimization; }
+      { switch = doJailbreak;                            function = hlib.doJailBreak; }
+      { switch = doStrip;                                function = hlib.doStrip; }
+      { switch = enableDWARFDebugging;                   function = hlib.enableDWARFDebugging; }
+      { switch = linkWithGold;                           function = hlib.linkWithGold; }
+      { switch = failOnAllWarnings;                      function = hlib.failOnAllWarnings; }
+      { switch = justStaticExecutables;                  function = hlib.justStaticExecutables; }
+      { switch = checkUnusedPackages;                    function = hlib.checkUnusedPackages {}; }
+      { switch = generateOptparseApplicativeCompletions; function = hlib.generateOptparseApplicativeCompletions executableNamesToShellComplete; }
+      { switch = doHyperlinkSource;                      function = hlib.doHyperlinkSource; }
     ];
 
-    enableLibraryProfiling = doProfiling;
-    enableExecutableProfiling = doProfiling;
+  # Function that applies enabled option to the package, used in the fold.
+  onSwitchApplyFunc = set: object:
+    if set.switch
+      then set.function object
+      else object;
 
-    testHaskellDepends = attrs.testHaskellDepends ++ [
-      pkgs.nix
-      haskellPackages.criterion
-    ];
+  # General description of package
+  package = haskellPackages.developPackage {
+    name = cabalName;
+    # Do not include into closure the files listed in .gitignore
+    root = packageRoot;
 
-    inherit doBenchmark;
-
-    configureFlags =
-         pkgs.stdenv.lib.optional doTracing  "--flags=tracing"
-      ++ pkgs.stdenv.lib.optional doOptimize "--flags=optimize"
-      ++ pkgs.stdenv.lib.optional doStrict   "--ghc-options=-Werror";
-
-    passthru = {
-      nixpkgs = pkgs;
-      inherit haskellPackages;
+    overrides = self: super: {
     };
-  });
 
-  returnShellEnv = false;
-}
+    modifier = drv: hlib.overrideCabal drv (attrs: {
+      buildTools = (attrs.buildTools or []) ++ [
+        haskellPackages.cabal-install
+      ];
+
+      testHaskellDepends = attrs.testHaskellDepends ++ [
+        pkgs.nix
+        haskellPackages.criterion
+      ];
+
+      # Declare that the header set arguments as according Haskell.lib switches
+      inherit allowInconsistentDependencies;
+      inherit doCheck;
+      inherit enableDeadCodeElimination;
+      inherit enableLibraryProfiling;
+      inherit enableExecutableProfiling;
+      inherit enableSharedLibraries;
+      inherit enableStaticLibraries;
+      inherit enableSharedExecutables;
+      inherit enableSeparateBinOutput;
+      inherit doBenchmark;
+      inherit doCoverage;
+      inherit doHaddock;
+
+      configureFlags = lib.optional doTracing  "--flags=tracing";
+
+      passthru = {
+        nixpkgs = pkgs;
+      };
+    });
+
+    inherit returnShellEnv withHoogle;
+  };
+
+  # One part of Haskell.lib options are argument switches, those are in `inherit`ed list.
+  # Other part - are function wrappers over pkg. Fold allows to compose those.
+  # composePackage = foldr (if switch then function) (package) ([{switch,function}]) == (functionN .. (function1 package))
+  composedPackage = lib.foldr (onSwitchApplyFunc) package listSwitchFunc;
+in 
+  # when returnShellEnv is enable, package is an shell env, we do not apply switch function. 
+  if returnShellEnv then package else composedPackage
+

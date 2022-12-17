@@ -1,79 +1,82 @@
-{-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE PartialTypeSignatures #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE TypeApplications #-}
-
 module TestCommon where
 
+import           Nix.Prelude
+import           GHC.Err                        ( errorWithoutStackTrace )
 import           Control.Monad.Catch
-import           Control.Monad.IO.Class
-import           Data.Text                      ( Text
-                                                , unpack
-                                                )
 import           Data.Time
+import           Data.Text.IO as Text
 import           Nix
-import           Nix.Exec                       ( )
 import           Nix.Standard
-import           Nix.Fresh.Basic
 import           System.Environment
 import           System.IO
-import           System.Posix.Files
-import           System.Posix.Temp
+import           System.PosixCompat.Files
+import           System.PosixCompat.Temp
 import           System.Process
 import           Test.Tasty.HUnit
 
-hnixEvalFile :: Options -> FilePath -> IO (StdValue (StandardT (StdIdT IO)))
-hnixEvalFile opts file = do
-  parseResult <- parseNixFileLoc file
-  case parseResult of
-    Failure err ->
-      error $ "Parsing failed for file `" ++ file ++ "`.\n" ++ show err
-    Success expr -> do
-      setEnv "TEST_VAR" "foo"
-      runWithBasicEffects opts
-        $ catch (evaluateExpression (Just file) nixEvalExprLoc normalForm expr)
-        $ \case
-            NixException frames ->
-              errorWithoutStackTrace
-                .   show
-                =<< renderFrames @(StdValue (StandardT (StdIdT IO)))
-                      @(StdThunk (StandardT (StdIdT IO)))
-                      frames
+hnixEvalFile :: Options -> Path -> IO StdVal
+hnixEvalFile opts file =
+  do
+    parseResult <- parseNixFileLoc file
+    either
+      (\ err -> fail $ "Parsing failed for file `" <> coerce file <> "`.\n" <> show err)
+      (\ expr ->
+        do
+          setEnv "TEST_VAR" "foo"
+          runWithBasicEffects opts $
+            evaluateExpression (pure $ coerce file) nixEvalExprLoc normalForm expr
+              `catch`
+                \case
+                  NixException frames ->
+                    errorWithoutStackTrace . show
+                      =<< renderFrames
+                          @StdVal
+                          @StdThun
+                          frames
+      )
+      parseResult
 
-hnixEvalText :: Options -> Text -> IO (StdValue (StandardT (StdIdT IO)))
-hnixEvalText opts src = case parseNixText src of
-  Failure err ->
-    error
-      $  "Parsing failed for expression `"
-      ++ unpack src
-      ++ "`.\n"
-      ++ show err
-  Success expr ->
-    runWithBasicEffects opts $ normalForm =<< nixEvalExpr Nothing expr
+nixEvalFile :: Path -> IO Text
+nixEvalFile (coerce -> fp) = fromString <$> readProcess "nix-instantiate" ["--eval", "--strict", fp] mempty
+hnixEvalText :: Options -> Text -> IO StdVal
+hnixEvalText opts src =
+  either
+    (\ err -> fail $ toString $ "Parsing failed for expression `" <> src <> "`.\n" <> show err)
+    (runWithBasicEffects opts . (normalForm <=< nixEvalExpr mempty))
+    $ parseNixText src
 
-nixEvalString :: String -> IO String
-nixEvalString expr = do
-  (fp, h) <- mkstemp "nix-test-eval"
-  hPutStr h expr
-  hClose h
-  res <- nixEvalFile fp
-  removeLink fp
-  return res
+nixEvalText :: Text -> IO Text
+nixEvalText expr =
+  do
+    (fp, h) <- mkstemp "nix-test-eval"
+    Text.hPutStr h expr
+    hClose h
+    res <- nixEvalFile $ coerce fp
+    removeLink fp
+    pure res
 
-nixEvalFile :: FilePath -> IO String
-nixEvalFile fp = readProcess "nix-instantiate" ["--eval", "--strict", fp] ""
+assertEvalMatchesNix
+  :: ( Options
+    -> Text -> IO (NValue t (StdCited StandardIO) StandardIO)
+    )
+  -> (Text -> IO Text)
+  -> Text
+  -> IO ()
+assertEvalMatchesNix evalHNix evalNix fp =
+  do
+    time    <- liftIO getCurrentTime
+    hnixVal <- (<> "\n") . printNix <$> evalHNix (defaultOptions time) fp
+    nixVal  <- evalNix fp
+    assertEqual (toString fp) nixVal hnixVal
 
-assertEvalFileMatchesNix :: FilePath -> Assertion
-assertEvalFileMatchesNix fp = do
-  time    <- liftIO getCurrentTime
-  hnixVal <- (++ "\n") . printNix <$> hnixEvalFile (defaultOptions time) fp
-  nixVal  <- nixEvalFile fp
-  assertEqual fp nixVal hnixVal
+-- | Compares @HNix@ & @Nix@ return results.
+assertEvalFileMatchesNix :: Path -> Assertion
+assertEvalFileMatchesNix fp =
+  assertEvalMatchesNix
+    (\ o -> hnixEvalFile o . coerce . toString)
+    (nixEvalFile . coerce . toString)
+    $ fromString $ coerce fp
 
-assertEvalMatchesNix :: Text -> Assertion
-assertEvalMatchesNix expr = do
-  time    <- liftIO getCurrentTime
-  hnixVal <- (++ "\n") . printNix <$> hnixEvalText (defaultOptions time) expr
-  nixVal  <- nixEvalString expr'
-  assertEqual expr' nixVal hnixVal
-  where expr' = unpack expr
+assertEvalTextMatchesNix :: Text -> Assertion
+assertEvalTextMatchesNix =
+  assertEvalMatchesNix hnixEvalText nixEvalText

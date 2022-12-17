@@ -1,0 +1,77 @@
+name: "Hackage, Cabal, Linux"
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+  schedule:
+    - cron: "45 02 * * *"
+
+env:
+  cabalConfig: --enable-tests --enable-benchmarks --disable-optimization --enable-deterministic
+
+jobs:
+
+  build10:
+    name: "GHC"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        ghc:
+          [ "8.8"
+          , "9.0"
+          , "9.2"
+          , "9.4"
+          ]
+    steps:
+
+      - name: "Git checkout"
+        uses: actions/checkout@v3
+        with:
+          submodules: recursive
+
+      - name: "Haskell env setup"
+        id: HaskEnvSetup
+        uses: haskell/actions/setup@v2
+        with:
+          ghc-version: ${{ matrix.ghc }}
+
+      - name: "Install additional system packages"
+        run: sudo apt install libsodium-dev
+
+      #  2020-08-01: NOTE: Nix instantiate still needed for HNix tests
+      - name: "Install Nix"
+        uses: cachix/install-nix-action@v18
+
+      - name: "Repository update"
+        run: cabal v2-update
+
+      # Freeze is for the caching
+      - name: "Configuration freeze"
+        run: cabal v2-freeze $cabalConfig --minimize-conflict-set
+
+      - name: "Configuring GitHub cache"
+        uses: actions/cache@v3
+        with:
+          path: |
+            ${{ steps.HaskEnvSetup.outputs.cabal-store }}
+            dist-newstyle
+          key: ${{ runner.os }}-Cabal-${{ matrix.ghc }}-${{ hashFiles('cabal.project.freeze') }}
+          # 2022-04-22: `v2-` added to invalidate corrupted caches, can be removed after one week
+          restore-keys: ${{ runner.os }}-Cabal-${{ matrix.ghc }}-v2-
+
+      - name: "Build"
+        run: cabal v2-build $cabalConfig
+
+      - name: "Tests"
+        run: cabal v2-test $cabalConfig
+
+      - name: "Haddock"
+        if: ${{ matrix.ghc == '9.0' }}
+        run: cabal v2-haddock $cabalConfig
+
+      - name: "Source distribution file"
+        if: ${{ matrix.ghc == '9.0' }}
+        run: cabal v2-sdist

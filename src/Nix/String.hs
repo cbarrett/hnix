@@ -1,217 +1,218 @@
-{-# LANGUAGE DeriveGeneric #-}
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
-{-# LANGUAGE OverloadedStrings #-}
-{-# OPTIONS_GHC -Wno-unused-top-binds #-}
+{-# language GeneralizedNewtypeDeriving #-}
+
 module Nix.String
   ( NixString
-  , principledGetContext
-  , principledMakeNixString
-  , principledMempty
+  , getStringContext
+  , mkNixString
   , StringContext(..)
   , ContextFlavor(..)
   , NixLikeContext(..)
   , NixLikeContextValue(..)
   , toNixLikeContext
   , fromNixLikeContext
-  , stringHasContext
-  , principledIntercalateNixString
-  , hackyGetStringNoContext
-  , principledGetStringNoContext
-  , principledStringIgnoreContext
-  , hackyStringIgnoreContext
-  , hackyMakeNixStringWithoutContext
-  , principledMakeNixStringWithoutContext
-  , principledMakeNixStringWithSingletonContext
-  , principledModifyNixContents
-  , principledStringMappend
-  , principledStringMempty
-  , principledStringMConcat
+  , hasContext
+  , intercalateNixString
+  , getStringNoContext
+  , ignoreContext
+  , mkNixStringWithoutContext
+  , mkNixStringWithSingletonContext
+  , modifyNixContents
   , WithStringContext
   , WithStringContextT(..)
   , extractNixString
   , addStringContext
   , addSingletonStringContext
   , runWithStringContextT
+  , runWithStringContextT'
   , runWithStringContext
+  , runWithStringContext'
   )
 where
 
-import           Control.Monad.Writer
-import           Data.Functor.Identity
+
+
+
+import           Nix.Prelude             hiding ( Type, TVar )
+import           Control.Monad.Writer           ( WriterT(..), MonadWriter(tell))
 import qualified Data.HashMap.Lazy             as M
 import qualified Data.HashSet                  as S
-import           Data.Hashable
-import           Data.Text                      ( Text )
 import qualified Data.Text                     as Text
-import           GHC.Generics
+import           Nix.Expr.Types                 ( VarName(..)
+                                                , AttrSet
+                                                )
 
--- {-# WARNING hackyGetStringNoContext, hackyStringIgnoreContext, hackyMakeNixStringWithoutContext "This NixString function needs to be replaced" #-}
+
+-- * Types
+
+-- ** Context
+
+-- | A Nix 'StringContext' ...
+data StringContext =
+  StringContext
+    { getStringContextFlavor :: !ContextFlavor
+    , getStringContextPath   :: !VarName
+    }
+  deriving (Eq, Ord, Show, Generic)
+
+instance Hashable StringContext
 
 -- | A 'ContextFlavor' describes the sum of possible derivations for string contexts
-data ContextFlavor =
-    DirectPath
+data ContextFlavor
+  = DirectPath
   | AllOutputs
   | DerivationOutput !Text
   deriving (Show, Eq, Ord, Generic)
 
 instance Hashable ContextFlavor
 
--- | A 'StringContext' ...
-data StringContext =
-  StringContext { scPath :: !Text
-                , scFlavor :: !ContextFlavor
-                } deriving (Eq, Ord, Show, Generic)
+newtype NixLikeContext =
+  NixLikeContext
+    { getNixLikeContext :: AttrSet NixLikeContextValue
+    }
+  deriving (Eq, Ord, Show, Generic)
 
-instance Hashable StringContext
-
-data NixString = NixString
-  { nsContents :: !Text
-  , nsContext :: !(S.HashSet StringContext)
-  } deriving (Eq, Ord, Show, Generic)
-
-instance Hashable NixString
-
-newtype NixLikeContext = NixLikeContext
-  { getNixLikeContext :: M.HashMap Text NixLikeContextValue
-  } deriving (Eq, Ord, Show, Generic)
-
-data NixLikeContextValue = NixLikeContextValue
-  { nlcvPath :: !Bool
-  , nlcvAllOutputs :: !Bool
-  , nlcvOutputs :: ![Text]
-  } deriving (Show, Eq, Ord, Generic)
+data NixLikeContextValue =
+  NixLikeContextValue
+    { nlcvPath :: !Bool
+    , nlcvAllOutputs :: !Bool
+    , nlcvOutputs :: ![Text]
+    }
+  deriving (Show, Eq, Ord, Generic)
 
 instance Semigroup NixLikeContextValue where
-  a <> b = NixLikeContextValue
-    { nlcvPath       = nlcvPath a || nlcvPath b
-    , nlcvAllOutputs = nlcvAllOutputs a || nlcvAllOutputs b
-    , nlcvOutputs    = nlcvOutputs a <> nlcvOutputs b
-    }
+  a <> b =
+    NixLikeContextValue
+      { nlcvPath       = nlcvPath       a || nlcvPath       b
+      , nlcvAllOutputs = nlcvAllOutputs a || nlcvAllOutputs b
+      , nlcvOutputs    = nlcvOutputs    a <> nlcvOutputs    b
+      }
 
 instance Monoid NixLikeContextValue where
-  mempty = NixLikeContextValue False False []
+  mempty = NixLikeContextValue False False mempty
 
-toStringContexts :: (Text, NixLikeContextValue) -> [StringContext]
-toStringContexts (path, nlcv) = case nlcv of
-  NixLikeContextValue True _ _ -> StringContext path DirectPath
-    : toStringContexts (path, nlcv { nlcvPath = False })
-  NixLikeContextValue _ True _ -> StringContext path AllOutputs
-    : toStringContexts (path, nlcv { nlcvAllOutputs = False })
-  NixLikeContextValue _ _ ls | not (null ls) ->
-    map (StringContext path . DerivationOutput) ls
-  _ -> []
 
-toNixLikeContextValue :: StringContext -> (Text, NixLikeContextValue)
-toNixLikeContextValue sc = (,) (scPath sc) $ case scFlavor sc of
-  DirectPath         -> NixLikeContextValue True False []
-  AllOutputs         -> NixLikeContextValue False True []
-  DerivationOutput t -> NixLikeContextValue False False [t]
-
-toNixLikeContext :: S.HashSet StringContext -> NixLikeContext
-toNixLikeContext stringContext = NixLikeContext
-  $ S.foldr go mempty stringContext
- where
-  go sc hm =
-    let (t, nlcv) = toNixLikeContextValue sc in M.insertWith (<>) t nlcv hm
-
-fromNixLikeContext :: NixLikeContext -> S.HashSet StringContext
-fromNixLikeContext =
-  S.fromList . join . map toStringContexts . M.toList . getNixLikeContext
-
-principledGetContext :: NixString -> S.HashSet StringContext
-principledGetContext = nsContext
-
--- | Combine two NixStrings using mappend
-principledMempty :: NixString
-principledMempty = NixString "" mempty
-
--- | Combine two NixStrings using mappend
-principledStringMappend :: NixString -> NixString -> NixString
-principledStringMappend (NixString s1 t1) (NixString s2 t2) =
-  NixString (s1 <> s2) (t1 <> t2)
-
--- | Combine two NixStrings using mappend
-hackyStringMappend :: NixString -> NixString -> NixString
-hackyStringMappend (NixString s1 t1) (NixString s2 t2) =
-  NixString (s1 <> s2) (t1 <> t2)
-
--- | Combine NixStrings with a separator
-principledIntercalateNixString :: NixString -> [NixString] -> NixString
-principledIntercalateNixString _   []   = principledMempty
-principledIntercalateNixString _   [ns] = ns
-principledIntercalateNixString sep nss  = NixString contents ctx
- where
-  contents = Text.intercalate (nsContents sep) (map nsContents nss)
-  ctx      = S.unions (nsContext sep : map nsContext nss)
-
--- | Combine NixStrings using mconcat
-hackyStringMConcat :: [NixString] -> NixString
-hackyStringMConcat = foldr hackyStringMappend (NixString mempty mempty)
-
--- | Empty string with empty context.
-principledStringMempty :: NixString
-principledStringMempty = NixString mempty mempty
-
--- | Combine NixStrings using mconcat
-principledStringMConcat :: [NixString] -> NixString
-principledStringMConcat =
-  foldr principledStringMappend (NixString mempty mempty)
-
---instance Semigroup NixString where
-  --NixString s1 t1 <> NixString s2 t2 = NixString (s1 <> s2) (t1 <> t2)
-
---instance Monoid NixString where
---  mempty = NixString mempty mempty
---  mappend = (<>)
-
--- | Extract the string contents from a NixString that has no context
-hackyGetStringNoContext :: NixString -> Maybe Text
-hackyGetStringNoContext (NixString s c) | null c    = Just s
-                                        | otherwise = Nothing
-
--- | Extract the string contents from a NixString that has no context
-principledGetStringNoContext :: NixString -> Maybe Text
-principledGetStringNoContext (NixString s c) | null c    = Just s
-                                             | otherwise = Nothing
-
--- | Extract the string contents from a NixString even if the NixString has an associated context
-principledStringIgnoreContext :: NixString -> Text
-principledStringIgnoreContext (NixString s _) = s
-
--- | Extract the string contents from a NixString even if the NixString has an associated context
-hackyStringIgnoreContext :: NixString -> Text
-hackyStringIgnoreContext (NixString s _) = s
-
--- | Returns True if the NixString has an associated context
-stringHasContext :: NixString -> Bool
-stringHasContext (NixString _ c) = not (null c)
-
--- | Constructs a NixString without a context
-hackyMakeNixStringWithoutContext :: Text -> NixString
-hackyMakeNixStringWithoutContext = flip NixString mempty
-
--- | Constructs a NixString without a context
-principledMakeNixStringWithoutContext :: Text -> NixString
-principledMakeNixStringWithoutContext = flip NixString mempty
-
--- | Modify the string part of the NixString, leaving the context unchanged
-principledModifyNixContents :: (Text -> Text) -> NixString -> NixString
-principledModifyNixContents f (NixString s c) = NixString (f s) c
-
--- | Create a NixString using a singleton context
-principledMakeNixStringWithSingletonContext
-  :: Text -> StringContext -> NixString
-principledMakeNixStringWithSingletonContext s c = NixString s (S.singleton c)
-
--- | Create a NixString from a Text and context
-principledMakeNixString :: Text -> S.HashSet StringContext -> NixString
-principledMakeNixString s c = NixString s c
+-- ** StringContext accumulator
 
 -- | A monad for accumulating string context while producing a result string.
-newtype WithStringContextT m a = WithStringContextT (WriterT (S.HashSet StringContext) m a)
+newtype WithStringContextT m a =
+  WithStringContextT
+    (WriterT (S.HashSet StringContext) m a )
   deriving (Functor, Applicative, Monad, MonadTrans, MonadWriter (S.HashSet StringContext))
 
 type WithStringContext = WithStringContextT Identity
+
+
+-- ** NixString
+
+data NixString =
+  NixString
+    { getStringContext :: !(S.HashSet StringContext)
+    , getStringContent :: !Text
+    }
+  deriving (Eq, Ord, Show, Generic)
+
+instance Semigroup NixString where
+  NixString s1 t1 <> NixString s2 t2 = NixString (s1 <> s2) (t1 <> t2)
+
+instance Monoid NixString where
+ mempty = NixString mempty mempty
+
+instance Hashable NixString
+
+
+-- * Functions
+
+-- ** Makers
+
+-- | Constructs NixString without a context
+mkNixStringWithoutContext :: Text -> NixString
+mkNixStringWithoutContext = NixString mempty
+
+-- | Create NixString using a singleton context
+mkNixStringWithSingletonContext
+  :: StringContext -> VarName -> NixString
+mkNixStringWithSingletonContext c s = NixString (one c) (coerce @VarName @Text s)
+
+-- | Create NixString from a Text and context
+mkNixString
+  :: S.HashSet StringContext -> Text -> NixString
+mkNixString = NixString
+
+
+-- ** Checkers
+
+-- | Returns True if the NixString has an associated context
+hasContext :: NixString -> Bool
+hasContext (NixString c _) = isPresent c
+
+
+-- ** Getters
+
+fromNixLikeContext :: NixLikeContext -> S.HashSet StringContext
+fromNixLikeContext =
+  S.fromList . (uncurry toStringContexts <=< M.toList . getNixLikeContext)
+
+-- | Extract the string contents from a NixString that has no context
+getStringNoContext :: NixString -> Maybe Text
+getStringNoContext (NixString c s)
+  | null c    = pure s
+  | otherwise = mempty
+
+-- | Extract the string contents from a NixString even if the NixString has an associated context
+ignoreContext :: NixString -> Text
+ignoreContext (NixString _ s) = s
+
+-- | Get the contents of a 'NixString' and write its context into the resulting set.
+extractNixString :: Monad m => NixString -> WithStringContextT m Text
+extractNixString (NixString c s) =
+  WithStringContextT $
+    s <$ tell c
+
+
+-- ** Setters
+
+-- this really should be 2 args, then with @toStringContexts path@ laziness it would tail recurse.
+-- for now tuple dissected internaly with laziness preservation.
+toStringContexts :: VarName -> NixLikeContextValue -> [StringContext]
+toStringContexts path = go
+ where
+  go :: NixLikeContextValue -> [StringContext]
+  go cv =
+    case cv of
+      NixLikeContextValue True _    _ ->
+        mkLstCtxFor DirectPath cv { nlcvPath = False }
+      NixLikeContextValue _    True _ ->
+        mkLstCtxFor AllOutputs cv { nlcvAllOutputs = False }
+      NixLikeContextValue _    _    ls | isPresent ls ->
+        mkCtxFor . DerivationOutput <$> ls
+      _ -> mempty
+   where
+    mkCtxFor :: ContextFlavor -> StringContext
+    mkCtxFor context = StringContext context path
+    mkLstCtxFor :: ContextFlavor -> NixLikeContextValue -> [StringContext]
+    mkLstCtxFor t c = one (mkCtxFor t) <> go c
+
+
+toNixLikeContextValue :: StringContext -> (NixLikeContextValue, VarName)
+toNixLikeContextValue sc =
+  ( case getStringContextFlavor sc of
+      DirectPath         -> NixLikeContextValue True False mempty
+      AllOutputs         -> NixLikeContextValue False True mempty
+      DerivationOutput t -> NixLikeContextValue False False $ one t
+  , getStringContextPath sc
+  )
+
+toNixLikeContext :: S.HashSet StringContext -> NixLikeContext
+toNixLikeContext stringContext =
+  NixLikeContext $
+    S.foldr
+      fun
+      mempty
+      stringContext
+ where
+  fun :: (StringContext -> AttrSet NixLikeContextValue -> AttrSet NixLikeContextValue)
+  fun sc hm =
+    uncurry (M.insertWith (<>)) (swap $ toNixLikeContextValue sc) hm
 
 -- | Add 'StringContext's into the resulting set.
 addStringContext
@@ -220,17 +221,42 @@ addStringContext = WithStringContextT . tell
 
 -- | Add a 'StringContext' into the resulting set.
 addSingletonStringContext :: Monad m => StringContext -> WithStringContextT m ()
-addSingletonStringContext = WithStringContextT . tell . S.singleton
-
--- | Get the contents of a 'NixString' and write its context into the resulting set.
-extractNixString :: Monad m => NixString -> WithStringContextT m Text
-extractNixString (NixString s c) = WithStringContextT $ tell c >> return s
+addSingletonStringContext = WithStringContextT . tell . one
 
 -- | Run an action producing a string with a context and put those into a 'NixString'.
 runWithStringContextT :: Monad m => WithStringContextT m Text -> m NixString
 runWithStringContextT (WithStringContextT m) =
-  uncurry NixString <$> runWriterT m
+  uncurry (flip NixString) <$> runWriterT m
 
 -- | Run an action producing a string with a context and put those into a 'NixString'.
 runWithStringContext :: WithStringContextT Identity Text -> NixString
 runWithStringContext = runIdentity . runWithStringContextT
+
+
+-- ** Modifiers
+
+-- | Modify the string part of the NixString, leaving the context unchanged
+modifyNixContents :: (Text -> Text) -> NixString -> NixString
+modifyNixContents f (NixString c s) = NixString c (f s)
+
+-- | Run an action that manipulates nix strings, and collect the contexts encountered.
+-- Warning: this may be unsafe, depending on how you handle the resulting context list.
+runWithStringContextT' :: Monad m => WithStringContextT m a -> m (a, S.HashSet StringContext)
+runWithStringContextT' (WithStringContextT m) = runWriterT m
+
+-- | Run an action that manipulates nix strings, and collect the contexts encountered.
+-- Warning: this may be unsafe, depending on how you handle the resulting context list.
+runWithStringContext' :: WithStringContextT Identity a -> (a, S.HashSet StringContext)
+runWithStringContext' = runIdentity . runWithStringContextT'
+
+-- | Combine NixStrings with a separator
+intercalateNixString :: NixString -> [NixString] -> NixString
+intercalateNixString _   []   = mempty
+intercalateNixString _   [ns] = ns
+intercalateNixString sep nss  =
+  uncurry NixString $
+    mapPair
+      (S.unions . (one (getStringContext  sep) <>) . (getStringContext <$>)
+      , Text.intercalate (getStringContent sep) . (getStringContent <$>)
+      )
+      $ dup nss

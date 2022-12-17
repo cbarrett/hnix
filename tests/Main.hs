@@ -1,21 +1,18 @@
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE QuasiQuotes #-}
-{-# LANGUAGE OverloadedStrings #-}
+{-# language QuasiQuotes #-}
 
 module Main where
 
-import           Control.DeepSeq
+import           Nix.Prelude
+import           Relude (force)
+import           Relude.Unsafe (read)
 import qualified Control.Exception as Exc
-import           Control.Applicative ((<|>))
-import           Control.Monad
+import           GHC.Err (errorWithoutStackTrace)
 import           Data.Fix
-import           Data.List (isSuffixOf)
-import           Data.Maybe
-import           Data.String.Interpolate.IsString
-import           Data.Text (unpack)
+import           Data.List (isSuffixOf, lookup)
+import qualified Data.String as String
 import           Data.Time
 import qualified EvalTests
+import           NeatInterpolation (text)
 import qualified Nix
 import           Nix.Expr.Types
 import           Nix.String
@@ -30,62 +27,70 @@ import qualified PrettyTests
 import qualified PrettyParseTests
 import qualified ReduceExprTests
 import           System.Directory
-import           System.Environment
-import           System.FilePath.Glob
-import           System.Posix.Files
+import           System.Environment (setEnv)
+import           System.FilePath.Glob (compile, globDir1)
+import           System.PosixCompat.Files
 import           Test.Tasty
 import           Test.Tasty.HUnit
 
 ensureLangTestsPresent :: Assertion
 ensureLangTestsPresent = do
   exist <- fileExist "data/nix/tests/local.mk"
-  unless exist $
-    errorWithoutStackTrace $ unlines
+  when (not exist) $
+    errorWithoutStackTrace $ String.unlines
       [ "Directory data/nix does not have any files."
       , "Did you forget to run"
-          ++ " \"git submodule update --init --recursive\"?" ]
+          <> " \"git submodule update --init --recursive\"?" ]
 
 ensureNixpkgsCanParse :: Assertion
 ensureNixpkgsCanParse =
   consider "default.nix" (parseNixFile "default.nix") $ \case
-    Fix (NAbs (ParamSet params _ _) _) -> do
-      let rev    = getString "rev" params
-          sha256 = getString "sha256" params
-      consider "fetchTarball expression" (pure $ parseNixTextLoc [i|
+    Fix (NAbs (ParamSet _ _ pset) _) -> do
+      let rev    = getString "rev" pset
+          sha256 = getString "sha256" pset
+      consider "fetchTarball expression" (pure $ parseNixTextLoc [text|
         builtins.fetchTarball {
-          url    = "https://github.com/NixOS/nixpkgs/archive/#{rev}.tar.gz";
-          sha256 = "#{sha256}";
+          url    = "https://github.com/NixOS/nixpkgs/archive/${rev}.tar.gz";
+          sha256 = "${sha256}";
         }|]) $ \expr -> do
         NVStr ns <- do
           time <- getCurrentTime
           runWithBasicEffectsIO (defaultOptions time) $
-            Nix.nixEvalExprLoc Nothing expr
-        let dir = hackyStringIgnoreContext ns
-        exists <- fileExist (unpack dir)
-        unless exists $
+            Nix.nixEvalExprLoc mempty expr
+        let dir = toString $ ignoreContext ns
+        exists <- fileExist dir
+        when (not exists) $
           errorWithoutStackTrace $
-            "Directory " ++ show dir ++ " does not exist"
-        files <- globDir1 (compile "**/*.nix") (unpack dir)
-        when (length files == 0) $
-          errorWithoutStackTrace $
-            "Directory " ++ show dir ++ " does not have any files"
-        forM_ files $ \file -> do
-          unless ("azure-cli/default.nix" `isSuffixOf` file ||
-                  "os-specific/linux/udisks/2-default.nix"  `isSuffixOf` file) $ do
-            -- Parse and deepseq the resulting expression tree, to ensure the
-            -- parser is fully executed.
-            _ <- consider file (parseNixFileLoc file) $ Exc.evaluate . force
-            return ()
-    v -> error $ "Unexpected parse from default.nix: " ++ show v
+            "Directory " <> show dir <> " does not exist"
+        files <- globDir1 (compile "**/*.nix") dir
+        handlePresence
+          (errorWithoutStackTrace $
+            "Directory " <> show dir <> " does not have any files")
+          (traverse_
+            (\ path ->
+              let notEndsIn suffix = not $ isSuffixOf suffix path in
+              when
+                (on (&&) notEndsIn "azure-cli/default.nix" "os-specific/linux/udisks/2-default.nix")
+                $ -- Parse and deepseq the resulting expression tree, to ensure the
+                  -- parser is fully executed.
+                  mempty <$ consider (coerce path) (parseNixFileLoc (coerce path)) $ Exc.evaluate . force
+            )
+          )
+          files
+    v -> fail $ "Unexpected parse from default.nix: " <> show v
  where
-  getExpr   k m = let Just (Just r) = lookup k m in r
+  getExpr   k m =
+    let Just r = join $ lookup k m in
+    r
   getString k m =
-      let Fix (NStr (DoubleQuoted [Plain str])) = getExpr k m in str
+    let Fix (NStr (DoubleQuoted [Plain str])) = getExpr k m in
+    str
 
-  consider path action k = action >>= \case
-    Failure err -> errorWithoutStackTrace $
-      "Parsing " ++ path ++ " failed: " ++ show err
-    Success expr -> k expr
+  consider path action k =
+    either
+      (\ err -> errorWithoutStackTrace $ "Parsing " <> coerce @Path path <> " failed: " <> show err)
+      k
+      =<< action
 
 main :: IO ()
 main = do
@@ -96,18 +101,19 @@ main = do
   prettyTestsEnv      <- lookupEnv "PRETTY_TESTS"
 
   pwd <- getCurrentDirectory
-  setEnv "NIX_REMOTE" ("local?root=" ++ pwd ++ "/")
+  setEnv "NIX_REMOTE" $ pwd <> "/real-store"
+  setEnv "NIX_DATA_DIR" $ pwd <> "/data"
 
   defaultMain $ testGroup "hnix" $
     [ ParserTests.tests
     , EvalTests.tests
     , PrettyTests.tests
     , ReduceExprTests.tests
-    , LexerTests.tests] ++
-    [ PrettyParseTests.tests
-        (fromIntegral (read (fromMaybe "0" prettyTestsEnv) :: Int)) ] ++
-    [ evalComparisonTests ] ++
-    [ testCase "Nix language tests present" ensureLangTestsPresent
-    , nixLanguageTests ] ++
+    , LexerTests.tests
+    , PrettyParseTests.tests $ fromIntegral $ read @Int $ fromMaybe "0" prettyTestsEnv
+    , evalComparisonTests
+    , testCase "Nix language tests present" ensureLangTestsPresent
+    , nixLanguageTests ] <>
     [ testCase "Nixpkgs parses without errors" ensureNixpkgsCanParse
-      | isJust nixpkgsTestsEnv ]
+      | isJust nixpkgsTestsEnv
+    ]

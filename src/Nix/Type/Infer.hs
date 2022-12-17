@@ -1,21 +1,13 @@
-{-# LANGUAGE AllowAmbiguousTypes #-}
-{-# LANGUAGE ConstraintKinds #-}
-{-# LANGUAGE ExistentialQuantification #-}
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE FlexibleInstances #-}
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
-{-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE MultiParamTypeClasses #-}
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE RankNTypes #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE StandaloneDeriving #-}
-{-# LANGUAGE TupleSections #-}
-{-# LANGUAGE TypeApplications #-}
-{-# LANGUAGE TypeFamilies #-}
-{-# LANGUAGE TypeSynonymInstances #-}
+{-# language MultiWayIf #-}
+{-# language CPP #-}
+{-# language AllowAmbiguousTypes #-}
+{-# language ConstraintKinds #-}
+{-# language ExistentialQuantification #-}
+{-# language GeneralizedNewtypeDeriving #-}
+{-# language RankNTypes #-}
+{-# language TypeFamilies #-}
 
-{-# OPTIONS_GHC -Wno-name-shadowing #-}
+{-# options_ghc -Wno-name-shadowing #-}
 
 module Nix.Type.Infer
   ( Constraint(..)
@@ -26,171 +18,107 @@ module Nix.Type.Infer
   )
 where
 
-import           Control.Applicative
-import           Control.Arrow
-import           Control.Monad.Catch
-import           Control.Monad.Except
-import           Control.Monad.Fail
-import           Control.Monad.Logic
-import           Control.Monad.Reader
-import           Control.Monad.Ref
-import           Control.Monad.ST
-import           Control.Monad.State.Strict
-import           Data.Fix                       ( cata )
-import           Data.Foldable
+import           Nix.Prelude             hiding ( Constraint
+                                                , Type
+                                                , TVar
+                                                )
+import           Control.Monad.Catch            ( MonadThrow(..)
+                                                , MonadCatch(..)
+                                                )
+import           Control.Monad.Except           ( MonadError(throwError,catchError) )
+import           Control.Monad.Logic     hiding ( fail )
+import           Control.Monad.Reader           ( MonadFix )
+import           Control.Monad.Ref              ( MonadAtomicRef(..)
+                                                , MonadRef(..)
+                                                )
+import           Control.Monad.ST               ( ST
+                                                , runST
+                                                )
+import           Data.Fix                       ( foldFix )
 import qualified Data.HashMap.Lazy             as M
 import           Data.List                      ( delete
-                                                , find
-                                                , nub
                                                 , intersect
                                                 , (\\)
+                                                , (!!)
                                                 )
-import           Data.Map                       ( Map )
+import qualified Data.List                     as List
 import qualified Data.Map                      as Map
 import           Data.Maybe                     ( fromJust )
 import qualified Data.Set                      as Set
-import           Data.Text                      ( Text )
 import           Nix.Atoms
 import           Nix.Convert
 import           Nix.Eval                       ( MonadEval(..) )
 import qualified Nix.Eval                      as Eval
+                                                ( eval
+                                                , evalWithAttrSet
+                                                )
 import           Nix.Expr.Types
-import           Nix.Expr.Types.Annotated
 import           Nix.Fresh
 import           Nix.String
 import           Nix.Scope
--- import           Nix.Thunk
--- import           Nix.Thunk.Basic
-import qualified Nix.Type.Assumption           as As
+import           Nix.Type.Assumption     hiding ( extend )
+import qualified Nix.Type.Assumption           as Assumption
 import           Nix.Type.Env
 import qualified Nix.Type.Env                  as Env
 import           Nix.Type.Type
-import           Nix.Utils
 import           Nix.Value.Monad
-import           Nix.Var
-
--------------------------------------------------------------------------------
--- Classes
--------------------------------------------------------------------------------
-
--- | Inference monad
-newtype InferT s m a = InferT
-    { getInfer ::
-        ReaderT (Set.Set TVar, Scopes (InferT s m) (Judgment s))
-            (StateT InferState (ExceptT InferError m)) a
-    }
-    deriving
-        ( Functor
-        , Applicative
-        , Alternative
-        , Monad
-        , MonadPlus
-        , MonadFix
-        , MonadReader (Set.Set TVar, Scopes (InferT s m) (Judgment s))
-        , MonadFail
-        , MonadState InferState
-        , MonadError InferError
-        )
-
-instance MonadTrans (InferT s) where
-  lift = InferT . lift . lift . lift
-
--- instance MonadThunkId m => MonadThunkId (InferT s m) where
---   type ThunkId (InferT s m) = ThunkId m
-
--- | Inference state
-newtype InferState = InferState { count :: Int }
-
--- | Initial inference state
-initInfer :: InferState
-initInfer = InferState { count = 0 }
-
-data Constraint
-    = EqConst Type Type
-    | ExpInstConst Type Scheme
-    | ImpInstConst Type (Set.Set TVar) Type
-    deriving (Show, Eq, Ord)
-
-newtype Subst = Subst (Map TVar Type)
-  deriving (Eq, Ord, Show, Semigroup, Monoid)
-
-class Substitutable a where
-  apply :: Subst -> a -> a
-
-instance Substitutable TVar where
-  apply (Subst s) a = tv
-   where
-    t         = TVar a
-    (TVar tv) = Map.findWithDefault t a s
-
-instance Substitutable Type where
-  apply _         (  TCon a   ) = TCon a
-  apply s         (  TSet b a ) = TSet b (M.map (apply s) a)
-  apply s         (  TList a  ) = TList (map (apply s) a)
-  apply (Subst s) t@(TVar  a  ) = Map.findWithDefault t a s
-  apply s         (  t1 :~> t2) = apply s t1 :~> apply s t2
-  apply s         (  TMany ts ) = TMany (map (apply s) ts)
-
-instance Substitutable Scheme where
-  apply (Subst s) (Forall as t) = Forall as $ apply s' t
-    where s' = Subst $ foldr Map.delete s as
-
-instance Substitutable Constraint where
-  apply s (EqConst      t1 t2) = EqConst (apply s t1) (apply s t2)
-  apply s (ExpInstConst t  sc) = ExpInstConst (apply s t) (apply s sc)
-  apply s (ImpInstConst t1 ms t2) =
-    ImpInstConst (apply s t1) (apply s ms) (apply s t2)
-
-instance Substitutable a => Substitutable [a] where
-  apply = map . apply
-
-instance (Ord a, Substitutable a) => Substitutable (Set.Set a) where
-  apply = Set.map . apply
 
 
-class FreeTypeVars a where
-  ftv :: a -> Set.Set TVar
+normalizeScheme :: Scheme -> Scheme
+normalizeScheme (Forall _ body) = Forall (snd <$> ord) (normtype body)
+ where
+  ord =
+    zip
+      (ordNub $ fv body)
+      (TV . fromString <$> letters)
 
-instance FreeTypeVars Type where
-  ftv TCon{}      = Set.empty
-  ftv (TVar a   ) = Set.singleton a
-  ftv (TSet _ a ) = Set.unions (map ftv (M.elems a))
-  ftv (TList a  ) = Set.unions (map ftv a)
-  ftv (t1 :~> t2) = ftv t1 `Set.union` ftv t2
-  ftv (TMany ts ) = Set.unions (map ftv ts)
+  fv (TVar a  ) = one a
+  fv (a :~> b ) = on (<>) fv a b
+  fv (TCon _  ) = mempty
+  fv (TSet _ a) = foldMap fv $ M.elems a
+  fv (TList a ) = foldMap fv a
+  fv (TMany ts) = foldMap fv ts
 
-instance FreeTypeVars TVar where
-  ftv = Set.singleton
+  normtype (a :~> b ) = normtype a :~> normtype b
+  normtype (TCon a  ) = TCon a
+  normtype (TSet b a) = TSet b $ normtype <$> a
+  normtype (TList a ) = TList $ normtype <$> a
+  normtype (TMany ts) = TMany $ normtype <$> ts
+  normtype (TVar  a ) =
+    maybe
+      (error "type variable not in signature")
+      TVar
+      (List.lookup a ord)
 
-instance FreeTypeVars Scheme where
-  ftv (Forall as t) = ftv t `Set.difference` Set.fromList as
+generalize :: Set.Set TVar -> Type -> Scheme
+generalize free t = Forall as t
+ where
+  as = Set.toList $ free `Set.difference` ftv t
 
-instance FreeTypeVars a => FreeTypeVars [a] where
-  ftv = foldr (Set.union . ftv) Set.empty
+-- | Canonicalize and return the polymorphic toplevel type.
+closeOver :: Type -> Scheme
+closeOver = normalizeScheme . generalize mempty
 
-instance (Ord a, FreeTypeVars a) => FreeTypeVars (Set.Set a) where
-  ftv = foldr (Set.union . ftv) Set.empty
+-- When `[]` becomes `NonEmpty` - function becomes just `all`
+-- | Check if all elements are of the same type.
+allSameType :: [Type] -> Bool
+allSameType = allSame
+ where
+  allSame :: Eq a => [a] -> Bool
+  allSame [] = True
+  allSame (x:xs) = all (x ==) xs
 
-
-class ActiveTypeVars a where
-  atv :: a -> Set.Set TVar
-
-instance ActiveTypeVars Constraint where
-  atv (EqConst t1 t2) = ftv t1 `Set.union` ftv t2
-  atv (ImpInstConst t1 ms t2) =
-    ftv t1 `Set.union` (ftv ms `Set.intersection` ftv t2)
-  atv (ExpInstConst t s) = ftv t `Set.union` ftv s
-
-instance ActiveTypeVars a => ActiveTypeVars [a] where
-  atv = foldr (Set.union . atv) Set.empty
+-- * data type @TypeError@
 
 data TypeError
   = UnificationFail Type Type
   | InfiniteType TVar Type
-  | UnboundVariables [Text]
+  | UnboundVariables [VarName]
   | Ambigious [Constraint]
   | UnificationMismatch [Type] [Type]
-  deriving (Eq, Show)
+  deriving (Eq, Show, Ord)
+
+-- * @InferError@
 
 data InferError
   = TypeInferenceErrors [TypeError]
@@ -198,176 +126,177 @@ data InferError
   | forall s. Exception s => EvaluationError s
 
 typeError :: MonadError InferError m => TypeError -> m ()
-typeError err = throwError $ TypeInferenceErrors [err]
+typeError err = throwError $ TypeInferenceErrors $ one err
+
+-- ** Instances
 
 deriving instance Show InferError
 instance Exception InferError
 
 instance Semigroup InferError where
-  x <> _ = x
+  (<>) = const
 
 instance Monoid InferError where
   mempty  = TypeInferenceAborted
-  mappend = (<>)
 
--------------------------------------------------------------------------------
--- Inference
--------------------------------------------------------------------------------
+-- * @InferState@: inference state
 
--- | Run the inference monad
-runInfer' :: MonadInfer m => InferT s m a -> m (Either InferError a)
-runInfer' =
-  runExceptT
-    . (`evalStateT` initInfer)
-    . (`runReaderT` (Set.empty, emptyScopes))
-    . getInfer
+-- | Inference state (stage).
+newtype InferState = InferState Int
+ deriving
+  (Eq, Num, Enum, Ord)
 
-runInfer :: (forall s . InferT s (FreshIdT Int (ST s)) a) -> Either InferError a
-runInfer m = runST $ do
-  i <- newVar (1 :: Int)
-  runFreshIdT i (runInfer' m)
+instance Semigroup InferState where
+  (<>) = (+)
 
-inferType
-  :: forall s m . MonadInfer m => Env -> NExpr -> InferT s m [(Subst, Type)]
-inferType env ex = do
-  Judgment as cs t <- infer ex
-  let unbounds =
-        Set.fromList (As.keys as) `Set.difference` Set.fromList (Env.keys env)
-  unless (Set.null unbounds) $ typeError $ UnboundVariables
-    (nub (Set.toList unbounds))
-  let cs' =
-        [ ExpInstConst t s
-        | (x, ss) <- Env.toList env
-        , s       <- ss
-        , t       <- As.lookup x as
-        ]
-  inferState <- get
-  let eres = (`evalState` inferState) $ runSolver $ do
-        subst <- solve (cs ++ cs')
-        return (subst, subst `apply` t)
-  case eres of
-    Left  errs -> throwError $ TypeInferenceErrors errs
-    Right xs   -> pure xs
+instance Monoid InferState where
+  mempty = 0
 
--- | Solve for the toplevel type of an expression in a given environment
-inferExpr :: Env -> NExpr -> Either InferError [Scheme]
-inferExpr env ex = case runInfer (inferType env ex) of
-  Left  err -> Left err
-  Right xs  -> Right $ map (\(subst, ty) -> closeOver (subst `apply` ty)) xs
-
--- | Canonicalize and return the polymorphic toplevel type.
-closeOver :: Type -> Scheme
-closeOver = normalizeScheme . generalize Set.empty
-
-extendMSet :: Monad m => TVar -> InferT s m a -> InferT s m a
-extendMSet x = InferT . local (first (Set.insert x)) . getInfer
+-- | Initial inference state
+initInfer :: InferState
+initInfer = InferState 0
 
 letters :: [String]
-letters = [1 ..] >>= flip replicateM ['a' .. 'z']
+letters =
+  do
+    l <- [1 ..]
+    replicateM
+      l
+      ['a' .. 'z']
 
 freshTVar :: MonadState InferState m => m TVar
-freshTVar = do
-  s <- get
-  put s { count = count s + 1 }
-  return $ TV (letters !! count s)
+freshTVar =
+  do
+    s <- get
+    put $ succ s
+    pure $ TV $ fromString $ letters !! coerce s
 
 fresh :: MonadState InferState m => m Type
 fresh = TVar <$> freshTVar
 
+intoFresh :: (Traversable t, MonadState InferState f) => t a -> f (t Type)
+intoFresh =
+  traverse (const fresh)
+
 instantiate :: MonadState InferState m => Scheme -> m Type
-instantiate (Forall as t) = do
-  as' <- mapM (const fresh) as
-  let s = Subst $ Map.fromList $ zip as as'
-  return $ apply s t
+instantiate (Forall as t) =
+  fmap ((`apply` t) . coerce . Map.fromList . zip as) (intoFresh as)
 
-generalize :: Set.Set TVar -> Type -> Scheme
-generalize free t = Forall as t
-  where as = Set.toList $ ftv t `Set.difference` free
+-- * @Constraint@ data type
 
-unops :: Type -> NUnaryOp -> [Constraint]
-unops u1 = \case
-  NNot -> [EqConst u1 (typeFun [typeBool, typeBool])]
-  NNeg ->
-    [ EqConst
-        u1
-        (TMany [typeFun [typeInt, typeInt], typeFun [typeFloat, typeFloat]])
-    ]
+data Constraint
+  = EqConst Type Type
+  | ExpInstConst Type Scheme
+  | ImpInstConst Type (Set.Set TVar) Type
+  deriving (Show, Eq, Ord)
 
-binops :: Type -> NBinaryOp -> [Constraint]
-binops u1 = \case
-  NApp  -> []                -- this is handled separately
+-- * @Subst@ data type
 
-  -- Equality tells you nothing about the types, because any two types are
-  -- allowed.
-  NEq   -> []
-  NNEq  -> []
+-- | Substitution of the basic type definition by a type variable.
+newtype Subst = Subst (Map TVar Type)
+  deriving (Eq, Ord, Show, Semigroup, Monoid)
 
-  NGt   -> inequality
-  NGte  -> inequality
-  NLt   -> inequality
-  NLte  -> inequality
+-- | Compose substitutions
+compose :: Subst -> Subst -> Subst
+compose a@(Subst s2) (Subst s1) =
+  coerce $ --
+    apply a <$>
+      (s2 <> s1)
 
-  NAnd  -> [EqConst u1 (typeFun [typeBool, typeBool, typeBool])]
-  NOr   -> [EqConst u1 (typeFun [typeBool, typeBool, typeBool])]
-  NImpl -> [EqConst u1 (typeFun [typeBool, typeBool, typeBool])]
+-- * class @Substitutable@
 
-  NConcat -> [EqConst u1 (typeFun [typeList, typeList, typeList])]
+class Substitutable a where
+  apply :: Subst -> a -> a
 
-  NUpdate ->
-    [ EqConst
-        u1
-        (TMany
-          [ typeFun [typeSet, typeSet, typeSet]
-          , typeFun [typeSet, typeNull, typeSet]
-          , typeFun [typeNull, typeSet, typeSet]
-          ]
-        )
-    ]
+-- ** Instances
 
-  NPlus ->
-    [ EqConst
-        u1
-        (TMany
-          [ typeFun [typeInt, typeInt, typeInt]
-          , typeFun [typeFloat, typeFloat, typeFloat]
-          , typeFun [typeInt, typeFloat, typeFloat]
-          , typeFun [typeFloat, typeInt, typeFloat]
-          , typeFun [typeString, typeString, typeString]
-          , typeFun [typePath, typePath, typePath]
-          , typeFun [typeString, typeString, typePath]
-          ]
-        )
-    ]
-  NMinus -> arithmetic
-  NMult  -> arithmetic
-  NDiv   -> arithmetic
+instance Substitutable TVar where
+  apply (Subst s) a = tv
+   where
+    (TVar tv) = Map.findWithDefault (TVar a) a s
+
+instance Substitutable Type where
+  apply _         (  TCon a   ) = TCon a
+  apply s         (  TSet b a ) = TSet b $ apply s <$> a
+  apply s         (  TList a  ) = TList  $ apply s <$> a
+  apply (Subst s) t@(TVar  a  ) = Map.findWithDefault t a s
+  apply s         (  t1 :~> t2) = ((:~>) `on` apply s) t1 t2
+  apply s         (  TMany ts ) = TMany  $ apply s <$> ts
+
+instance Substitutable Scheme where
+  apply (Subst s) (Forall as t) = Forall as $ apply s' t
+   where
+    s' = Subst $ foldr Map.delete s as
+
+instance Substitutable Constraint where
+  apply s (EqConst      t1 t2) = on EqConst (apply s) t1 t2
+  apply s (ExpInstConst t  sc) =
+    ExpInstConst
+      (apply s t)
+      (apply s sc)
+  apply s (ImpInstConst t1 ms t2) =
+    ImpInstConst
+      (apply s t1)
+      (apply s ms)
+      (apply s t2)
+
+instance Substitutable a => Substitutable [a] where
+  apply = fmap . apply
+
+instance (Ord a, Substitutable a) => Substitutable (Set.Set a) where
+  apply = Set.map . apply
+
+
+-- * data type @Judgment@
+
+data Judgment s =
+  Judgment
+    { assumptions     :: Assumption
+    , typeConstraints :: [Constraint]
+    , inferredType    :: Type
+    }
+    deriving Show
+
+inferred :: Type -> Judgment s
+inferred = Judgment mempty mempty
+
+-- * @InferT@: inference monad
+
+type InferTInternals s m a =
+  ReaderT
+    (Set.Set TVar, Scopes (InferT s m) (Judgment s))
+    (StateT InferState (ExceptT InferError m))
+    a
+
+-- | Inference monad
+newtype InferT s m a =
+  InferT
+    { getInfer ::
+        InferTInternals s m a
+    }
+    deriving
+      ( Functor
+      , Applicative
+      , Alternative
+      , Monad
+      , MonadPlus
+      , MonadFix
+      , MonadReader (Set.Set TVar, Scopes (InferT s m) (Judgment s))
+      , MonadFail
+      , MonadState InferState
+      , MonadError InferError
+      )
+
+extendMSet :: forall s m a . Monad m => TVar -> InferT s m a -> InferT s m a
+extendMSet x = coerce putSetElementM
  where
-  inequality =
-    [ EqConst
-        u1
-        (TMany
-          [ typeFun [typeInt, typeInt, typeBool]
-          , typeFun [typeFloat, typeFloat, typeBool]
-          , typeFun [typeInt, typeFloat, typeBool]
-          , typeFun [typeFloat, typeInt, typeBool]
-          ]
-        )
-    ]
+  putSetElementM :: InferTInternals s m a -> InferTInternals s m a
+  putSetElementM = local (first . Set.insert $ x)
 
-  arithmetic =
-    [ EqConst
-        u1
-        (TMany
-          [ typeFun [typeInt, typeInt, typeInt]
-          , typeFun [typeFloat, typeFloat, typeFloat]
-          , typeFun [typeInt, typeFloat, typeFloat]
-          , typeFun [typeFloat, typeInt, typeFloat]
-          ]
-        )
-    ]
+-- ** Instances
 
-liftInfer :: Monad m => m a -> InferT s m a
-liftInfer = InferT . lift . lift . lift
+instance MonadTrans (InferT s) where
+  lift = InferT . lift . lift . lift
 
 instance MonadRef m => MonadRef (InferT s m) where
   type Ref (InferT s m) = Ref m
@@ -376,325 +305,549 @@ instance MonadRef m => MonadRef (InferT s m) where
   writeRef x y = liftInfer $ writeRef x y
 
 instance MonadAtomicRef m => MonadAtomicRef (InferT s m) where
-  atomicModifyRef x f = liftInfer $ do
-    res <- snd . f <$> readRef x
-    _   <- modifyRef x (fst . f)
-    return res
-
--- newtype JThunkT s m = JThunk (NThunkF (InferT s m) (Judgment s))
+  atomicModifyRef x f =
+    liftInfer $
+      do
+        res <- snd . f <$> readRef x
+        _   <- modifyRef x $ fst . f
+        pure res
 
 instance Monad m => MonadThrow (InferT s m) where
   throwM = throwError . EvaluationError
 
 instance Monad m => MonadCatch (InferT s m) where
-  catch m h = catchError m $ \case
-    EvaluationError e -> maybe
-      (error $ "Exception was not an exception: " ++ show e)
-      h
-      (fromException (toException e))
-    err -> error $ "Unexpected error: " ++ show err
+  catch m h =
+    catchError m $
+      \case
+        EvaluationError e ->
+          maybe
+            (error $ "Exception was not an exception: " <> show e)
+            h
+            (fromException $ toException e)
+        err -> error $ "Unexpected error: " <> show err
 
-type MonadInfer m
-  = ({- MonadThunkId m,-}
-     MonadVar m, MonadFix m)
+-- instance MonadThunkId m => MonadThunkId (InferT s m) where
+--   type ThunkId (InferT s m) = ThunkId m
 
+instance
+  Monad m
+  => FromValue NixString (InferT s m) (Judgment s)
+ where
+  fromValueMay _ = stub
+  fromValue _ = error "Unused"
+
+instance
+  MonadInfer m
+  => FromValue ( AttrSet (Judgment s)
+              , PositionSet
+              ) (InferT s m) (Judgment s)
+ where
+  fromValueMay (Judgment _ _ (TSet _ xs)) =
+    do
+      let sing = const inferred
+      pure $ pure (M.mapWithKey sing xs, mempty)
+  fromValueMay _ = stub
+  fromValue =
+    pure .
+      maybeToMonoid
+      <=< fromValueMay
+
+foldInitializedWith :: (Traversable t, Applicative f) => (t c -> c) -> (b -> c) -> (a -> f b) -> t a -> f c
+foldInitializedWith fld getter init =
+  -- maybe here is some law?
+  fmap fld . traverse (fmap getter . init)
+
+toJudgment :: forall t m s . (Traversable t, Monad m) => (t Type -> Type) -> t (Judgment s) -> InferT s m (Judgment s)
+toJudgment c xs =
+  liftA3 Judgment
+    (foldWith fold assumptions    )
+    (foldWith fold typeConstraints)
+    (foldWith c    inferredType   )
+   where
+    foldWith :: (t a -> a) -> (Judgment s -> a) -> InferT s m a
+    foldWith g f = foldInitializedWith g f demand xs
+
+instance MonadInfer m
+  => ToValue (AttrSet (Judgment s), PositionSet)
+            (InferT s m) (Judgment s) where
+  toValue :: (AttrSet (Judgment s), PositionSet) -> InferT s m (Judgment s)
+  toValue (xs, _) = toJudgment (TSet Variadic) xs -- why variadic? Probably `Closed` (`mempty`)?
+
+instance MonadInfer m => ToValue [Judgment s] (InferT s m) (Judgment s) where
+  toValue = toJudgment TList
+
+instance MonadInfer m => ToValue Bool (InferT s m) (Judgment s) where
+  toValue _ = pure $ inferred typeBool
+
+instance
+  Monad m
+  => Scoped (Judgment s) (InferT s m) where
+  askScopes   = askScopesReader
+  clearScopes = clearScopesReader @(InferT s m) @(Judgment s)
+  pushScopes  = pushScopesReader
+  lookupVar   = lookupVarReader
+
+-- newtype JThunkT s m = JThunk (NThunkF (InferT s m) (Judgment s))
+
+--  2021-02-22: NOTE: Seems like suporflous instance
 instance Monad m => MonadValue (Judgment s) (InferT s m) where
+  defer
+    :: InferT s m (Judgment s)
+    -> InferT s m (Judgment s)
   defer  = id
-  demand = flip ($)
-  inform j f = f (pure j)
+
+  demand
+    :: Judgment s
+    -> InferT s m (Judgment s)
+  demand = pure
+
+  inform
+    :: Judgment s
+    -> InferT s m (Judgment s)
+  inform = pure
+
+
+--  2021-02-22: NOTE: Seems like suporflous instance
+instance Monad m => MonadValueF (Judgment s) (InferT s m) where
+
+  demandF
+    :: ( Judgment s
+      -> InferT s m r)
+    -> Judgment s
+    -> InferT s m r
+  demandF f = f
+
+  informF
+    :: ( InferT s m (Judgment s)
+      -> InferT s m (Judgment s)
+      )
+    -> Judgment s
+    -> InferT s m (Judgment s)
+  informF f = f . pure
 
 {-
 instance MonadInfer m
   => MonadThunk (JThunkT s m) (InferT s m) (Judgment s) where
-  thunk = fmap JThunk . thunk
+
   thunkId (JThunk x) = thunkId x
 
-  queryM (JThunk x) b f = queryM x b f
+  thunk = fmap JThunk . thunk
+
+  query b (JThunk x) = query b x
 
   -- If we have a thunk loop, we just don't know the type.
-  force (JThunk t) f = catch (force t f)
+  force (JThunk t) = catch (force t)
     $ \(_ :: ThunkLoop) ->
-                           f =<< Judgment As.empty [] <$> fresh
+                           f =<< Judgment mempty mempty <$> fresh
 
   -- If we have a thunk loop, we just don't know the type.
-  forceEff (JThunk t) f = catch (forceEff t f)
+  forceEff (JThunk t) = catch (forceEff t)
     $ \(_ :: ThunkLoop) ->
-                           f =<< Judgment As.empty [] <$> fresh
+                           f =<< Judgment mempty mempty <$> fresh
 -}
 
+polymorphicVar :: MonadInfer m => VarName -> InferT s m (Judgment s)
+polymorphicVar var =
+  fmap
+    (join $ (`Judgment` mempty) . curry one var)
+    fresh
+
+constInfer :: Applicative f => Type -> b -> f (Judgment s)
+constInfer x = const $ pure $ inferred x
+
 instance MonadInfer m => MonadEval (Judgment s) (InferT s m) where
-  freeVariable var = do
-    tv <- fresh
-    return $ Judgment (As.singleton var tv) [] tv
+  freeVariable = polymorphicVar
 
-  synHole var = do
-    tv <- fresh
-    return $ Judgment (As.singleton var tv) [] tv
+  synHole = polymorphicVar
 
--- If we fail to look up an attribute, we just don't know the type.
-  attrMissing _ _ = Judgment As.empty [] <$> fresh
+  -- If we fail to look up an attribute, we just don't know the type.
+  attrMissing _ _ = inferred <$> fresh
 
   evaledSym _ = pure
 
-  evalCurPos = return $ Judgment As.empty [] $ TSet False $ M.fromList
-    [("file", typePath), ("line", typeInt), ("col", typeInt)]
+  evalCurPos =
+    pure $
+      inferred $
+        TSet mempty $
+          M.fromList
+            [ ("file", typePath)
+            , ("line", typeInt )
+            , ("col" , typeInt )
+            ]
 
-  evalConstant c = return $ Judgment As.empty [] (go c)
+  evalConstant c = pure $ inferred $ fun c
    where
-    go = \case
+    fun = \case
+      NURI   _ -> typeString
       NInt   _ -> typeInt
       NFloat _ -> typeFloat
       NBool  _ -> typeBool
       NNull    -> typeNull
 
-  evalString      = const $ return $ Judgment As.empty [] typeString
-  evalLiteralPath = const $ return $ Judgment As.empty [] typePath
-  evalEnvPath     = const $ return $ Judgment As.empty [] typePath
+  evalString      = constInfer typeString
+  evalLiteralPath = constInfer typePath
+  evalEnvPath     = constInfer typePath
 
-  evalUnary op (Judgment as1 cs1 t1) = do
-    tv <- fresh
-    return $ Judgment as1 (cs1 ++ unops (t1 :~> tv) op) tv
+  evalUnary op (Judgment as1 cs1 t1) =
+    (Judgment as1 =<< (cs1 <>) . (`unops` op) . (t1 :~>)) <$> fresh
 
-  evalBinary op (Judgment as1 cs1 t1) e2 = do
-    Judgment as2 cs2 t2 <- e2
-    tv                  <- fresh
-    return $ Judgment (as1 `As.merge` as2)
-                      (cs1 ++ cs2 ++ binops (t1 :~> t2 :~> tv) op)
-                      tv
+  evalBinary op (Judgment as1 cs1 t1) e2 =
+    do
+      Judgment as2 cs2 t2 <- e2
+      (Judgment (as1 <> as2) =<< ((cs1 <> cs2) <>) . (`binops` op) . ((t1 :~> t2) :~>)) <$> fresh
 
   evalWith = Eval.evalWithAttrSet
 
   evalIf (Judgment as1 cs1 t1) t f = do
     Judgment as2 cs2 t2 <- t
     Judgment as3 cs3 t3 <- f
-    return $ Judgment
-      (as1 `As.merge` as2 `As.merge` as3)
-      (cs1 ++ cs2 ++ cs3 ++ [EqConst t1 typeBool, EqConst t2 t3])
-      t2
+    pure $
+      Judgment
+        (as1 <> as2 <> as3)
+        (cs1 <> cs2 <> cs3 <> [EqConst t1 typeBool, EqConst t2 t3])
+        t2
 
   evalAssert (Judgment as1 cs1 t1) body = do
     Judgment as2 cs2 t2 <- body
-    return
-      $ Judgment (as1 `As.merge` as2) (cs1 ++ cs2 ++ [EqConst t1 typeBool]) t2
+    pure $
+      Judgment
+        (as1 <> as2)
+        (cs1 <> cs2 <> one (EqConst t1 typeBool))
+        t2
 
   evalApp (Judgment as1 cs1 t1) e2 = do
     Judgment as2 cs2 t2 <- e2
     tv                  <- fresh
-    return $ Judgment (as1 `As.merge` as2)
-                      (cs1 ++ cs2 ++ [EqConst t1 (t2 :~> tv)])
-                      tv
+    pure $
+      Judgment
+        (as1 <> as2)
+        (cs1 <> cs2 <> one (EqConst t1 (t2 :~> tv)))
+        tv
 
   evalAbs (Param x) k = do
     a <- freshTVar
     let tv = TVar a
-    ((), Judgment as cs t) <- extendMSet
-      a
-      (k (pure (Judgment (As.singleton x tv) [] tv)) (\_ b -> ((), ) <$> b))
-    return $ Judgment (as `As.remove` x)
-                      (cs ++ [ EqConst t' tv | t' <- As.lookup x as ])
-                      (tv :~> t)
+    ((), Judgment as cs t) <-
+      extendMSet
+        a
+        $ k
+          (pure (join ((`Judgment` mempty) . curry one x ) tv))
+          $ const $ fmap (mempty,)
+    pure $
+      Judgment
+        (as `Assumption.remove` x)
+        (cs <> [ EqConst t' tv | t' <- Assumption.lookup x as ])
+        (tv :~> t)
 
-  evalAbs (ParamSet ps variadic _mname) k = do
-    js <- fmap concat $ forM ps $ \(name, _) -> do
-      tv <- fresh
-      pure [(name, tv)]
+  evalAbs (ParamSet _mname variadic pset) k = do
+    js <- foldInitializedWith fold one intoFresh pset
 
-    let (env, tys) =
-          (\f -> foldl' f (As.empty, M.empty) js) $ \(as1, t1) (k, t) ->
-            (as1 `As.merge` As.singleton k t, M.insert k t t1)
-        arg   = pure $ Judgment env [] (TSet True tys)
-        call  = k arg $ \args b -> (args, ) <$> b
-        names = map fst js
+    let
+      f (as1, t1) (k, t) = (as1 <> one (k, t), M.insert k t t1)
+      (env, tys) = foldl' f mempty js
+      arg   = pure $ Judgment env mempty $ TSet Variadic tys
+      call  = k arg $ \args b -> (args, ) <$> b
+      names = fst <$> js
 
-    (args, Judgment as cs t) <- foldr (\(_, TVar a) -> extendMSet a) call js
+    (args, Judgment as cs t) <- foldr (extendMSet . (\ (TVar a) -> a) . snd) call js
 
-    ty <- TSet variadic <$> traverse (inferredType <$>) args
+    ty <- foldInitializedWith (TSet variadic) inferredType id args
 
-    return $ Judgment
-      (foldl' As.remove as names)
-      (cs ++ [ EqConst t' (tys M.! x) | x <- names, t' <- As.lookup x as ])
-      (ty :~> t)
+    pure $
+      Judgment
+        (foldl' Assumption.remove as names)
+        (cs <> [ EqConst t' (tys M.! x) | x <- names, t' <- Assumption.lookup x as ])
+        (ty :~> t)
 
   evalError = throwError . EvaluationError
 
-data Judgment s = Judgment
-    { assumptions     :: As.Assumption
-    , typeConstraints :: [Constraint]
-    , inferredType    :: Type
-    }
-    deriving Show
+-- * class @FreeTypeVars@
 
-instance Monad m => FromValue NixString (InferT s m) (Judgment s) where
-  fromValueMay _ = return Nothing
-  fromValue _ = error "Unused"
+class FreeTypeVars a where
+  ftv :: a -> Set.Set TVar
 
-instance MonadInfer m
-  => FromValue (AttrSet (Judgment s), AttrSet SourcePos)
-              (InferT s m) (Judgment s) where
-  fromValueMay (Judgment _ _ (TSet _ xs)) = do
-    let sing _ = Judgment As.empty []
-    pure $ Just (M.mapWithKey sing xs, M.empty)
-  fromValueMay _ = pure Nothing
-  fromValue = fromValueMay >=> \case
-    Just v  -> pure v
-    Nothing -> pure (M.empty, M.empty)
+occursCheck :: FreeTypeVars a => TVar -> a -> Bool
+occursCheck a t = a `Set.member` ftv t
 
-instance MonadInfer m
-  => ToValue (AttrSet (Judgment s), AttrSet SourcePos)
-            (InferT s m) (Judgment s) where
-  toValue (xs, _) =
-    Judgment
-      <$> foldrM go As.empty xs
-      <*> (concat <$> traverse (`demand` (pure . typeConstraints)) xs)
-      <*> (TSet True <$> traverse (`demand` (pure . inferredType)) xs)
-    where go x rest = demand x $ \x' -> pure $ As.merge (assumptions x') rest
+-- ** Instances
 
-instance MonadInfer m => ToValue [Judgment s] (InferT s m) (Judgment s) where
-  toValue xs =
-    Judgment
-      <$> foldrM go As.empty xs
-      <*> (concat <$> traverse (`demand` (pure . typeConstraints)) xs)
-      <*> (TList <$> traverse (`demand` (pure . inferredType)) xs)
-    where go x rest = demand x $ \x' -> pure $ As.merge (assumptions x') rest
+instance FreeTypeVars Type where
+  ftv TCon{}      = mempty
+  ftv (TVar a   ) = one a
+  ftv (TSet _ a ) = Set.unions $ ftv <$> M.elems a
+  ftv (TList a  ) = Set.unions $ ftv <$> a
+  ftv (t1 :~> t2) = ftv t1 <> ftv t2
+  ftv (TMany ts ) = Set.unions $ ftv <$> ts
 
-instance MonadInfer m => ToValue Bool (InferT s m) (Judgment s) where
-  toValue _ = pure $ Judgment As.empty [] typeBool
+instance FreeTypeVars TVar where
+  ftv = one
+
+instance FreeTypeVars Scheme where
+  ftv (Forall as t) = ftv t `Set.difference` Set.fromList as
+
+instance FreeTypeVars a => FreeTypeVars [a] where
+  ftv = foldr ((<>) . ftv) mempty
+
+instance (Ord a, FreeTypeVars a) => FreeTypeVars (Set.Set a) where
+  ftv = foldr ((<>) . ftv) mempty
+
+-- * class @ActiveTypeVars@
+
+class ActiveTypeVars a where
+  atv :: a -> Set.Set TVar
+
+-- ** Instances
+
+instance ActiveTypeVars Constraint where
+  atv (EqConst      t1 t2   ) = ftv t1 <> ftv t2
+  atv (ImpInstConst t1 ms t2) = ftv t1 <> (ftv ms `Set.intersection` ftv t2)
+  atv (ExpInstConst t  s    ) = ftv t  <> ftv s
+
+instance ActiveTypeVars a => ActiveTypeVars [a] where
+  atv = foldr ((<>) . atv) mempty
+
+-- * Other
+
+type MonadInfer m
+  = ({- MonadThunkId m,-}
+     MonadAtomicRef m, MonadFix m)
+
+-- | Run the inference monad
+runInfer' :: MonadInfer m => InferT s m a -> m (Either InferError a)
+runInfer' =
+  runExceptT
+    . (`evalStateT` initInfer)
+    . (`runReaderT` mempty)
+    . getInfer
+
+runInfer :: (forall s . InferT s (FreshIdT Int (ST s)) a) -> Either InferError a
+runInfer m =
+  runST $ runFreshIdT (runInfer' m) =<< newRef (1 :: Int)
+
+inferType
+  :: forall s m . MonadInfer m => Env -> NExpr -> InferT s m [(Subst, Type)]
+inferType env ex =
+  do
+    Judgment as cs t <- infer ex
+    let
+      unbounds :: Set VarName
+      unbounds =
+        (Set.difference `on` Set.fromList)
+          (Assumption.keys as )
+          (       Env.keys env)
+    when
+      (isPresent unbounds)
+      $ typeError $ UnboundVariables $ ordNub $ Set.toList unbounds
+
+    inferState <- get
+    let
+      cs' =
+        [ ExpInstConst t s
+            | (x, ss) <- Env.toList env
+            , s       <- ss
+            , t       <- Assumption.lookup x as
+        ]
+      evalResult =
+        (`evalState` inferState) . runSolver $ second (`apply` t) . join (,) <$> solve (cs <> cs')
+
+    either
+      (throwError . TypeInferenceErrors)
+      pure
+      evalResult
+
+-- | Solve for the toplevel type of an expression in a given environment
+inferExpr :: Env -> NExpr -> Either InferError [Scheme]
+inferExpr env ex =
+  closeOver . uncurry apply <<$>> runInfer (inferType env ex)
+
+unops :: Type -> NUnaryOp -> [Constraint]
+unops u1 op =
+  one $
+    EqConst u1 $
+      case op of
+        NNot -> mkUnaryConstr typeBool
+        NNeg -> TMany $ mkUnaryConstr <$> [typeInt, typeFloat]
+ where
+  mkUnaryConstr :: Type -> Type
+  mkUnaryConstr = typeFun . mk2same
+   where
+    mk2same :: a -> NonEmpty a
+    mk2same a = a :| one a
+
+binops :: Type -> NBinaryOp -> [Constraint]
+binops u1 op =
+  if
+    -- Equality tells nothing about the types, because any two types are allowed.
+    | op `elem` [ NEq   , NNEq               ] -> mempty
+    | op `elem` [ NGt   , NGte , NLt  , NLte ] -> inequality
+    | op `elem` [ NAnd  , NOr  , NImpl       ] -> gate
+    | op ==       NConcat                      -> concatenation
+    | op `elem` [ NMinus, NMult, NDiv        ] -> arithmetic
+    | op ==       NUpdate                      -> rUnion
+    | op ==       NPlus                        -> addition
+    | otherwise -> fail "GHC so far can not infer that this pattern match is full, so make it happy."
+
+ where
+
+  mk3 :: a -> a -> a -> NonEmpty a
+  mk3 a b c = a :| [b, c]
+
+  mk3same :: a -> NonEmpty a
+  mk3same a = a :| [a, a]
+
+  allConst :: Type -> [Constraint]
+  allConst = one . EqConst u1 . typeFun . mk3same
+
+  gate          = allConst typeBool
+  concatenation = allConst typeList
+
+  eqConstrMtx :: [NonEmpty Type] -> [Constraint]
+  eqConstrMtx = one . EqConst u1 . TMany . fmap typeFun
+
+  inequality =
+    eqConstrMtx
+      [ mk3 typeInt   typeInt   typeBool
+      , mk3 typeFloat typeFloat typeBool
+      , mk3 typeInt   typeFloat typeBool
+      , mk3 typeFloat typeInt   typeBool
+      ]
+
+  arithmetic =
+    eqConstrMtx
+      [ mk3same typeInt
+      , mk3same typeFloat
+      , mk3 typeInt   typeFloat typeFloat
+      , mk3 typeFloat typeInt   typeFloat
+      ]
+
+  rUnion =
+    eqConstrMtx
+      [ mk3same typeSet
+      , mk3 typeSet  typeNull typeSet
+      , mk3 typeNull typeSet  typeSet
+      ]
+
+  addition =
+    eqConstrMtx
+      [ mk3same typeInt
+      , mk3same typeFloat
+      , mk3 typeInt    typeFloat  typeFloat
+      , mk3 typeFloat  typeInt    typeFloat
+      , mk3same typeString
+      , mk3same typePath
+      , mk3 typeString typeString typePath
+      ]
+
+liftInfer :: Monad m => m a -> InferT s m a
+liftInfer = InferT . lift . lift . lift
+
+-- * Other
 
 infer :: MonadInfer m => NExpr -> InferT s m (Judgment s)
-infer = cata Eval.eval
+infer = foldFix Eval.eval
 
-inferTop :: Env -> [(Text, NExpr)] -> Either InferError Env
-inferTop env []                = Right env
-inferTop env ((name, ex) : xs) = case inferExpr env ex of
-  Left  err -> Left err
-  Right ty  -> inferTop (extend env (name, ty)) xs
+inferTop :: Env -> [(VarName, NExpr)] -> Either InferError Env
+inferTop env []                = pure env
+inferTop env ((name, ex) : xs) =
+  (\ ty -> inferTop (extend env (name, ty)) xs)
+    =<< inferExpr env ex
 
-normalizeScheme :: Scheme -> Scheme
-normalizeScheme (Forall _ body) = Forall (map snd ord) (normtype body)
- where
-  ord = zip (nub $ fv body) (map TV letters)
-
-  fv (TVar a  ) = [a]
-  fv (a :~> b ) = fv a ++ fv b
-  fv (TCon _  ) = []
-  fv (TSet _ a) = concatMap fv (M.elems a)
-  fv (TList a ) = concatMap fv a
-  fv (TMany ts) = concatMap fv ts
-
-  normtype (a :~> b ) = normtype a :~> normtype b
-  normtype (TCon a  ) = TCon a
-  normtype (TSet b a) = TSet b (M.map normtype a)
-  normtype (TList a ) = TList (map normtype a)
-  normtype (TMany ts) = TMany (map normtype ts)
-  normtype (TVar  a ) = case Prelude.lookup a ord of
-    Just x  -> TVar x
-    Nothing -> error "type variable not in signature"
-
--------------------------------------------------------------------------------
--- Constraint Solver
--------------------------------------------------------------------------------
+-- * Other
 
 newtype Solver m a = Solver (LogicT (StateT [TypeError] m) a)
     deriving (Functor, Applicative, Alternative, Monad, MonadPlus,
               MonadLogic, MonadState [TypeError])
 
+runSolver :: forall m a . Monad m => Solver m a -> m (Either [TypeError] [a])
+runSolver (Solver s) =
+  uncurry report <$> runStateT (observeAllT s) mempty
+ where
+  report :: [a] -> [TypeError] -> Either [TypeError] [a]
+  report xs e =
+    handlePresence
+      (Left $ ordNub e)
+      pure
+      xs
+
+-- ** Instances
+
 instance MonadTrans Solver where
   lift = Solver . lift . lift
 
 instance Monad m => MonadError TypeError (Solver m) where
-  throwError err = Solver $ lift (modify (err :)) >> mzero
+  throwError err = Solver $ lift (modify (err :)) *> mempty
   catchError _ _ = error "This is never used"
 
-runSolver :: Monad m => Solver m a -> m (Either [TypeError] [a])
-runSolver (Solver s) = do
-  res <- runStateT (observeAllT s) []
-  pure $ case res of
-    (x : xs, _ ) -> Right (x : xs)
-    (_     , es) -> Left (nub es)
-
--- | The empty substitution
-emptySubst :: Subst
-emptySubst = mempty
-
--- | Compose substitutions
-compose :: Subst -> Subst -> Subst
-Subst s1 `compose` Subst s2 =
-  Subst $ Map.map (apply (Subst s1)) s2 `Map.union` s1
-
-unifyMany :: Monad m => [Type] -> [Type] -> Solver m Subst
-unifyMany []         []         = return emptySubst
-unifyMany (t1 : ts1) (t2 : ts2) = do
-  su1 <- unifies t1 t2
-  su2 <- unifyMany (apply su1 ts1) (apply su1 ts2)
-  return (su2 `compose` su1)
-unifyMany t1 t2 = throwError $ UnificationMismatch t1 t2
-
-allSameType :: [Type] -> Bool
-allSameType []           = True
-allSameType [_         ] = True
-allSameType (x : y : ys) = x == y && allSameType (y : ys)
-
-unifies :: Monad m => Type -> Type -> Solver m Subst
-unifies t1 t2 | t1 == t2  = return emptySubst
-unifies (TVar v) t        = v `bind` t
-unifies t        (TVar v) = v `bind` t
-unifies (TList xs) (TList ys)
-  | allSameType xs && allSameType ys = case (xs, ys) of
-    (x : _, y : _) -> unifies x y
-    _              -> return emptySubst
-  | length xs == length ys = unifyMany xs ys
--- We assume that lists of different lengths containing various types cannot
--- be unified.
-unifies t1@(TList _    ) t2@(TList _    ) = throwError $ UnificationFail t1 t2
-unifies (   TSet True _) (   TSet True _) = return emptySubst
-unifies (TSet False b) (TSet True s)
-  | M.keys b `intersect` M.keys s == M.keys s = return emptySubst
-unifies (TSet True s) (TSet False b)
-  | M.keys b `intersect` M.keys s == M.keys b = return emptySubst
-unifies (TSet False s) (TSet False b) | null (M.keys b \\ M.keys s) =
-  return emptySubst
-unifies (t1 :~> t2) (t3 :~> t4) = unifyMany [t1, t2] [t3, t4]
-unifies (TMany t1s) t2          = considering t1s >>- unifies ?? t2
-unifies t1          (TMany t2s) = considering t2s >>- unifies t1
-unifies t1          t2          = throwError $ UnificationFail t1 t2
+-- * Other
 
 bind :: Monad m => TVar -> Type -> Solver m Subst
-bind a t | t == TVar a     = return emptySubst
+bind a t | t == TVar a     = stub
          | occursCheck a t = throwError $ InfiniteType a t
-         | otherwise       = return (Subst $ Map.singleton a t)
-
-occursCheck :: FreeTypeVars a => TVar -> a -> Bool
-occursCheck a t = a `Set.member` ftv t
-
-nextSolvable :: [Constraint] -> (Constraint, [Constraint])
-nextSolvable xs = fromJust (find solvable (chooseOne xs))
- where
-  chooseOne xs = [ (x, ys) | x <- xs, let ys = delete x xs ]
-
-  solvable (EqConst{}     , _) = True
-  solvable (ExpInstConst{}, _) = True
-  solvable (ImpInstConst _t1 ms t2, cs) =
-    Set.null ((ftv t2 `Set.difference` ms) `Set.intersection` atv cs)
+         | otherwise       = pure $ Subst $ one (a, t)
 
 considering :: [a] -> Solver m a
 considering xs = Solver $ LogicT $ \c n -> foldr c n xs
 
-solve :: MonadState InferState m => [Constraint] -> Solver m Subst
-solve [] = return emptySubst
-solve cs = solve' (nextSolvable cs)
- where
-  solve' (EqConst t1 t2, cs) = unifies t1 t2
-    >>- \su1 -> solve (apply su1 cs) >>- \su2 -> return (su2 `compose` su1)
+unifies :: Monad m => Type -> Type -> Solver m Subst
+unifies t1 t2 | t1 == t2  = stub
+unifies (TVar v) t        = v `bind` t
+unifies t        (TVar v) = v `bind` t
+unifies (TList xs) (TList ys)
+  | allSameType xs && allSameType ys =
+      case (xs, ys) of
+        (x : _, y : _) -> unifies x y
+        _              -> stub
+  | length xs == length ys = unifyMany xs ys
+-- Putting a statement that lists of different lengths containing various types would not
+-- be unified.
+unifies t1@(TList _    ) t2@(TList _    ) = throwError $ UnificationFail t1 t2
+unifies (TSet Variadic _) (TSet Variadic _)                                 = stub
+unifies (TSet Closed   s) (TSet Closed   b) | null (M.keys b \\ M.keys s)   = stub
+unifies (TSet _ a) (TSet _ b) | (M.keys a `intersect` M.keys b) == M.keys b = stub
+unifies (t1 :~> t2) (t3 :~> t4) = unifyMany [t1, t2] [t3, t4]
+unifies (TMany t1s) t2          = considering t1s >>- (`unifies` t2)
+unifies t1          (TMany t2s) = considering t2s >>- unifies t1
+unifies t1          t2          = throwError $ UnificationFail t1 t2
 
+unifyMany :: Monad m => [Type] -> [Type] -> Solver m Subst
+unifyMany []         []         = stub
+unifyMany (t1 : ts1) (t2 : ts2) =
+  do
+    su1 <- unifies t1 t2
+    su2 <-
+      (unifyMany `on` apply su1) ts1 ts2
+    pure $ compose su1 su2
+unifyMany t1 t2 = throwError $ UnificationMismatch t1 t2
+
+nextSolvable :: [Constraint] -> (Constraint, [Constraint])
+nextSolvable = fromJust . find solvable . pickFirstOne
+ where
+  pickFirstOne :: Eq a => [a] -> [(a, [a])]
+  pickFirstOne xs = [ (x, ys) | x <- xs, let ys = delete x xs ]
+
+  solvable :: (Constraint, [Constraint]) -> Bool
+  solvable (EqConst{}     , _) = True
+  solvable (ExpInstConst{}, _) = True
+  solvable (ImpInstConst _t1 ms t2, cs) =
+    null $ (ms `Set.difference` ftv t2) `Set.intersection` atv cs
+
+solve :: forall m . MonadState InferState m => [Constraint] -> Solver m Subst
+solve [] = stub
+solve cs = solve' $ nextSolvable cs
+ where
   solve' (ImpInstConst t1 ms t2, cs) =
     solve (ExpInstConst t1 (generalize ms t2) : cs)
+  solve' (ExpInstConst t s, cs) =
+    do
+      s' <- lift $ instantiate s
+      solve (EqConst t s' : cs)
+  solve' (EqConst t1 t2, cs) =
+    (\ su1 ->
+      (pure . compose su1) -<< solve ((`apply` cs) su1)
+    ) -<<
+    unifies t1 t2
 
-  solve' (ExpInstConst t s, cs) = do
-    s' <- lift $ instantiate s
-    solve (EqConst t s' : cs)
-
-instance Monad m => Scoped (Judgment s) (InferT s m) where
-  currentScopes = currentScopesReader
-  clearScopes   = clearScopesReader @(InferT s m) @(Judgment s)
-  pushScopes    = pushScopesReader
-  lookupVar     = lookupVarReader
+infixr 1 -<<
+-- | @LogicT@ fair conjunction, since library has only @>>-@
+(-<<) :: Monad m => (a -> Solver m b) -> Solver m a -> Solver m b
+(-<<) = flip (>>-)

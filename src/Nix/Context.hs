@@ -1,35 +1,33 @@
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE FlexibleInstances #-}
-{-# LANGUAGE MultiParamTypeClasses #-}
-
 module Nix.Context where
 
-import           Nix.Options
-import           Nix.Scope
-import           Nix.Frames
-import           Nix.Utils
+import           Nix.Prelude
+import           Nix.Options                    ( Options )
+import           Nix.Scope                      ( Scopes )
+import           Nix.Frames                     ( Frames )
 import           Nix.Expr.Types.Annotated       ( SrcSpan
                                                 , nullSpan
                                                 )
 
-data Context m t = Context
-    { scopes  :: Scopes m t
-    , source  :: SrcSpan
-    , frames  :: Frames
-    , options :: Options
+--  2021-07-18: NOTE: It should be Options -> Scopes -> Frames -> Source(span)
+data Context m t =
+  Context
+    { getOptions :: Options
+    , getScopes  :: Scopes m t
+    , getSource  :: SrcSpan
+    , getFrames  :: Frames
     }
 
 instance Has (Context m t) (Scopes m t) where
-  hasLens f (Context x y z w) = (\x' -> Context x' y z w) <$> f x
+  hasLens f a = (\x -> a { getScopes = x }) <$> f (getScopes a)
 
 instance Has (Context m t) SrcSpan where
-  hasLens f (Context x y z w) = (\y' -> Context x y' z w) <$> f y
+  hasLens f a = (\x -> a { getSource = x }) <$> f (getSource a)
 
 instance Has (Context m t) Frames where
-  hasLens f (Context x y z w) = (\z' -> Context x y z' w) <$> f z
+  hasLens f a = (\x -> a { getFrames = x }) <$> f (getFrames a)
 
 instance Has (Context m t) Options where
-  hasLens f (Context x y z w) = (\w' -> Context x y z w') <$> f w
+  hasLens f a = (\x -> a { getOptions = x }) <$> f (getOptions a)
 
 newContext :: Options -> Context m t
-newContext = Context emptyScopes nullSpan []
+newContext o = Context o mempty nullSpan mempty

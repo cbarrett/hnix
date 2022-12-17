@@ -1,25 +1,17 @@
-{-# LANGUAGE DataKinds #-}
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE FlexibleInstances #-}
-{-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE MonoLocalBinds #-}
-{-# LANGUAGE NoMonomorphismRestriction #-}
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE UndecidableInstances #-}
+{-# language DataKinds #-}
+{-# language MonoLocalBinds #-}
+{-# language NoMonomorphismRestriction #-}
 
-{-# OPTIONS -Wno-orphans#-}
+
 
 module PrettyParseTests where
 
+import           Nix.Prelude
 import           Data.Algorithm.Diff
 import           Data.Algorithm.DiffOutput
 import           Data.Char
 import           Data.Fix
-import qualified Data.List.NonEmpty            as NE
-import           Data.Text                      ( Text
-                                                , pack
-                                                )
-import           Data.Text.Prettyprint.Doc
+import qualified Data.String                   as String
 import           Hedgehog
 import qualified Hedgehog.Gen                  as Gen
 import qualified Hedgehog.Range                as Range
@@ -27,30 +19,35 @@ import           Nix.Atoms
 import           Nix.Expr
 import           Nix.Parser
 import           Nix.Pretty
+import           Prettyprinter
 import           Test.Tasty
 import           Test.Tasty.Hedgehog
-import           Text.Megaparsec                ( Pos
-                                                , SourcePos
-                                                , mkPos
-                                                )
 import qualified Text.Show.Pretty              as PS
 
 asciiString :: MonadGen m => m String
 asciiString = Gen.list (Range.linear 1 15) Gen.lower
 
 asciiText :: Gen Text
-asciiText = pack <$> asciiString
+asciiText = fromString <$> asciiString
+
+asciiVarName :: Gen VarName
+asciiVarName = coerce <$> asciiText
 
 -- Might want to replace this instance with a constant value
-genPos :: Gen Pos
-genPos = mkPos <$> Gen.int (Range.linear 1 256)
+genNPos :: Gen NPos
+genNPos = fmap coerce $ mkPos <$> Gen.int (Range.linear 1 256)
 
-genSourcePos :: Gen SourcePos
-genSourcePos = SourcePos <$> asciiString <*> genPos <*> genPos
+genNSourcePos :: Gen NSourcePos
+genNSourcePos =
+  join (liftA3
+      NSourcePos
+      (fmap coerce asciiString)
+    )
+    genNPos
 
 genKeyName :: Gen (NKeyName NExpr)
 genKeyName =
-  Gen.choice [DynamicKey <$> genAntiquoted genString, StaticKey <$> asciiText]
+  Gen.choice [DynamicKey <$> genAntiquoted genString, StaticKey <$> asciiVarName]
 
 genAntiquoted :: Gen a -> Gen (Antiquoted a NExpr)
 genAntiquoted gen =
@@ -58,38 +55,54 @@ genAntiquoted gen =
 
 genBinding :: Gen (Binding NExpr)
 genBinding = Gen.choice
-  [ NamedVar <$> genAttrPath <*> genExpr <*> genSourcePos
-  , Inherit
-  <$> Gen.maybe genExpr
-  <*> Gen.list (Range.linear 0 5) genKeyName
-  <*> genSourcePos
+  [ liftA3 NamedVar
+      genAttrPath
+      genExpr
+      genNSourcePos
+  , liftA3 Inherit
+      (Gen.maybe genExpr)
+      (Gen.list (Range.linear 0 5) asciiVarName)
+      genNSourcePos
   ]
 
 genString :: Gen (NString NExpr)
 genString = Gen.choice
-  [ DoubleQuoted <$> Gen.list (Range.linear 0 5) (genAntiquoted asciiText)
-  , Indented <$> Gen.int (Range.linear 0 10) <*> Gen.list
-    (Range.linear 0 5)
-    (genAntiquoted asciiText)
+  [ DoubleQuoted <$> genLines
+  , liftA2 Indented
+      (Gen.int $ Range.linear 0 10)
+      genLines
   ]
+ where
+  genLines =
+    Gen.list
+      (Range.linear 0 5)
+      (genAntiquoted asciiText)
 
 genAttrPath :: Gen (NAttrPath NExpr)
-genAttrPath = (NE.:|) <$> genKeyName <*> Gen.list (Range.linear 0 4) genKeyName
+genAttrPath =
+  liftA2 (:|)
+    genKeyName
+    $ Gen.list (Range.linear 0 4) genKeyName
 
 genParams :: Gen (Params NExpr)
 genParams = Gen.choice
-  [ Param <$> asciiText
-  , ParamSet
-  <$> Gen.list (Range.linear 0 10) ((,) <$> asciiText <*> Gen.maybe genExpr)
-  <*> Gen.bool
-  <*> Gen.choice [pure Nothing, Just <$> asciiText]
+  [ Param <$> asciiVarName
+  , liftA3 (mkGeneralParamSet . pure)
+      (Gen.choice [stub, asciiText])
+      (Gen.list (Range.linear 0 10) $
+        liftA2 (,)
+          asciiText
+          (Gen.maybe genExpr)
+      )
+      Gen.bool
   ]
+
 
 genAtom :: Gen NAtom
 genAtom = Gen.choice
-  [ NInt <$> Gen.integral (Range.linear 0 1000)
-  , NFloat <$> Gen.float (Range.linearFrac 0.0 1000.0)
-  , NBool <$> Gen.bool
+  [ NInt   <$> Gen.integral (Range.linear     0   1000  )
+  , NFloat <$> Gen.float    (Range.linearFrac 0.0 1000.0)
+  , NBool  <$> Gen.bool
   , pure NNull
   ]
 
@@ -97,48 +110,65 @@ genAtom = Gen.choice
 -- list Arbitrary instance which makes the generator terminate. The
 -- distribution is not scientifically chosen.
 genExpr :: Gen NExpr
-genExpr = Gen.sized $ \(Size n) -> Fix <$> if n < 2
-  then Gen.choice [genConstant, genStr, genSym, genLiteralPath, genEnvPath]
-  else Gen.frequency
-    [ (1 , genConstant)
-    , (1 , genSym)
-    , (4 , Gen.resize (Size (n `div` 3)) genIf)
-    , (10, genRecSet)
-    , (20, genSet)
-    , (5 , genList)
-    , (2 , genUnary)
-    , (2, Gen.resize (Size (n `div` 3)) genBinary)
-    , (3, Gen.resize (Size (n `div` 3)) genSelect)
-    , (20, Gen.resize (Size (n `div` 2)) genAbs)
-    , (2, Gen.resize (Size (n `div` 2)) genHasAttr)
-    , (10, Gen.resize (Size (n `div` 2)) genLet)
-    , (10, Gen.resize (Size (n `div` 2)) genWith)
-    , (1, Gen.resize (Size (n `div` 2)) genAssert)
-    ]
+genExpr =
+  Gen.sized genCurbed
  where
-  genConstant    = NConstant <$> genAtom
-  genStr         = NStr <$> genString
-  genSym         = NSym <$> asciiText
-  genList        = NList <$> fairList genExpr
-  genSet         = NSet NNonRecursive <$> fairList genBinding
-  genRecSet      = NSet NRecursive <$> fairList genBinding
-  genLiteralPath = NLiteralPath . ("./" ++) <$> asciiString
-  genEnvPath     = NEnvPath <$> asciiString
-  genUnary       = NUnary <$> Gen.enumBounded <*> genExpr
-  genBinary      = NBinary <$> Gen.enumBounded <*> genExpr <*> genExpr
-  genSelect      = NSelect <$> genExpr <*> genAttrPath <*> Gen.maybe genExpr
-  genHasAttr     = NHasAttr <$> genExpr <*> genAttrPath
-  genAbs         = NAbs <$> genParams <*> genExpr
-  genLet         = NLet <$> fairList genBinding <*> genExpr
-  genIf          = NIf <$> genExpr <*> genExpr <*> genExpr
-  genWith        = NWith <$> genExpr <*> genExpr
-  genAssert      = NAssert <$> genExpr <*> genExpr
+  genCurbed (coerce -> n) =
+    Fix <$>
+      bool
+        small
+        big
+        (n >= 2)
+   where
+
+    genConstant    = NConstant                         <$> genAtom
+    genStr         = NStr                              <$> genString
+    genSym         = NSym                              <$> asciiVarName
+    genLiteralPath = NLiteralPath . ("./" <>) . coerce <$> asciiString
+    genEnvPath     = NEnvPath . coerce                 <$> asciiString
+
+    small = Gen.choice [genConstant, genStr, genSym, genLiteralPath, genEnvPath]
+
+    big =
+      let
+          sizeDivBy i = Size $ n `div` i
+          resizeDivBy i = Gen.resize (sizeDivBy i)
+      in
+      Gen.frequency
+        [ (1 , genConstant)
+        , (1 , genSym)
+        , (2 , genUnary)
+        , (5 , genList)
+        , (20, genSet)
+        , (10, genRecSet)
+        , (1 , resizeDivBy 2 genAssert)
+        , (4 , resizeDivBy 3 genIf)
+        , (2 , resizeDivBy 3 genBinary)
+        , (3 , resizeDivBy 3 genSelect)
+        , (20, resizeDivBy 2 genAbs)
+        , (2 , resizeDivBy 2 genHasAttr)
+        , (10, resizeDivBy 2 genLet)
+        , (10, resizeDivBy 2 genWith)
+        ]
+     where
+      genList        = NList                             <$> fairList genExpr
+      genSet         = NSet mempty                       <$> fairList genBinding
+      genRecSet      = NSet Recursive                    <$> fairList genBinding
+      genUnary       = liftA2 NUnary   Gen.enumBounded       genExpr
+      genBinary      = join (liftA3 NBinary  Gen.enumBounded) genExpr
+      genSelect      = liftA3 NSelect  (Gen.maybe genExpr)   genExpr     genAttrPath
+      genHasAttr     = liftA2 NHasAttr genExpr               genAttrPath
+      genAbs         = liftA2 NAbs     genParams             genExpr
+      genLet         = liftA2 NLet     (fairList genBinding) genExpr
+      genIf          = join (liftA3 NIf      genExpr) genExpr
+      genWith        = join (liftA2 NWith) genExpr
+      genAssert      = join (liftA2 NAssert) genExpr
 
 -- | Useful when there are recursive positions at each element of the list as
 --   it divides the size by the length of the generated list.
 fairList :: Gen a -> Gen [a]
 fairList g = Gen.sized $ \s -> do
-  k <- Gen.int (Range.linear 0 (unSize s))
+  k <- Gen.int $ Range.linear 0 $ unSize s
   -- Use max here to avoid dividing by zero when there is the empty list
   Gen.resize (Size (unSize s `div` max 1 k)) $ Gen.list (Range.singleton k) g
 
@@ -146,87 +176,103 @@ equivUpToNormalization :: NExpr -> NExpr -> Bool
 equivUpToNormalization x y = normalize x == normalize y
 
 normalize :: NExpr -> NExpr
-normalize = cata $ \case
+normalize = foldFix $ \case
   NConstant (NInt n) | n < 0 ->
-    Fix (NUnary NNeg (Fix (NConstant (NInt (negate n)))))
+    mkNeg $ mkInt $ negate n
   NConstant (NFloat n) | n < 0 ->
-    Fix (NUnary NNeg (Fix (NConstant (NFloat (negate n)))))
+    mkNeg $ mkFloat $ negate n
 
-  NSet recur binds -> Fix (NSet recur (map normBinding binds))
-  NLet binds  r -> Fix (NLet (map normBinding binds) r)
+  NSet recur binds ->
+    mkSet recur $ normBinding <$> binds
+  NLet binds  r ->
+    mkLets (normBinding <$> binds) r
 
-  NAbs params r -> Fix (NAbs (normParams params) r)
+  NAbs params r ->
+    mkFunction (normParams params) r
 
   r             -> Fix r
 
  where
-  normBinding (NamedVar path r     pos) = NamedVar (NE.map normKey path) r pos
-  normBinding (Inherit  mr   names pos) = Inherit mr (map normKey names) pos
+  normBinding (NamedVar path r     pos) = NamedVar (normKey <$> path) r pos
+  normBinding (Inherit  mr   names pos) = Inherit mr names pos
 
   normKey (DynamicKey quoted) = DynamicKey (normAntiquotedString quoted)
   normKey (StaticKey  name  ) = StaticKey name
 
   normAntiquotedString
-    :: Antiquoted (NString NExpr) NExpr -> Antiquoted (NString NExpr) NExpr
+    :: Antiquoted (NString NExpr) NExpr
+    -> Antiquoted (NString NExpr) NExpr
   normAntiquotedString (Plain (DoubleQuoted [EscapedNewline])) = EscapedNewline
   normAntiquotedString (Plain (DoubleQuoted strs)) =
-    let strs' = map normAntiquotedText strs
-    in  if strs == strs'
-          then Plain (DoubleQuoted strs)
-          else normAntiquotedString (Plain (DoubleQuoted strs'))
+    bool normAntiquotedString id (strs == strs')
+      (Plain $ DoubleQuoted strs')
+    where
+     strs' = normAntiquotedText <$> strs
   normAntiquotedString r = r
 
-  normAntiquotedText :: Antiquoted Text NExpr -> Antiquoted Text NExpr
+  normAntiquotedText
+    :: Antiquoted Text NExpr
+    -> Antiquoted Text NExpr
   normAntiquotedText (Plain "\n"  ) = EscapedNewline
   normAntiquotedText (Plain "''\n") = EscapedNewline
   normAntiquotedText r              = r
 
-  normParams (ParamSet binds var (Just "")) = ParamSet binds var Nothing
+  normParams (ParamSet (Just "") variadic pset) = ParamSet Nothing variadic pset
   normParams r                              = r
 
 -- | Test that parse . pretty == id up to attribute position information.
 prop_prettyparse :: Monad m => NExpr -> PropertyT m ()
-prop_prettyparse p = do
-  let prog = show (prettyNix p)
-  case parse (pack prog) of
-    Failure s -> do
+prop_prettyparse p =
+  either
+    (\ s -> do
       footnote $ show $ vsep
-        [fillSep ["Parse failed:", pretty (show s)], indent 2 (prettyNix p)]
+        -- Remove :: Text type annotation after String -> Text migration.
+        [fillSep ["Parse failed:", pretty (show s :: Text)], indent 2 $ prettyNix p]
       discard
-    Success v
-      | equivUpToNormalization p v -> success
-      | otherwise -> do
-        let pp = normalise prog
-            pv = normalise (show (prettyNix v))
-        footnote
-          $ show
-          $ vsep
-          $ [ "----------------------------------------"
-            , vsep ["Expr before:", indent 2 (pretty (PS.ppShow p))]
-            , "----------------------------------------"
-            , vsep ["Expr after:", indent 2 (pretty (PS.ppShow v))]
-            , "----------------------------------------"
-            , vsep ["Pretty before:", indent 2 (pretty prog)]
-            , "----------------------------------------"
-            , vsep ["Pretty after:", indent 2 (prettyNix v)]
-            , "----------------------------------------"
-            , vsep ["Normalised before:", indent 2 (pretty pp)]
-            , "----------------------------------------"
-            , vsep ["Normalised after:", indent 2 (pretty pv)]
-            , "========================================"
-            , vsep ["Normalised diff:", pretty (ppDiff (diff pp pv))]
-            , "========================================"
-            ]
-        assert (pp == pv)
+    )
+    (\ v ->
+      bool
+        (do
+          let
+            pp = normalise prog
+            pv = normalise $ show $ prettyNix v
+
+          footnote $
+            show $
+              vsep
+                [ "----------------------------------------"
+                , vsep ["Expr before:"      , indent 2 $ pretty $ PS.ppShow p]
+                , "----------------------------------------"
+                , vsep ["Expr after:"       , indent 2 $ pretty $ PS.ppShow v]
+                , "----------------------------------------"
+                , vsep ["Pretty before:"    , indent 2 $ pretty prog]
+                , "----------------------------------------"
+                , vsep ["Pretty after:"     , indent 2 $ prettyNix v]
+                , "----------------------------------------"
+                , vsep ["Normalised before:", indent 2 $ pretty pp]
+                , "----------------------------------------"
+                , vsep ["Normalised after:" , indent 2 $ pretty pv]
+                , "========================================"
+                , vsep ["Normalised diff:"  , pretty $ ppDiff $ ldiff pp pv]
+                , "========================================"
+                ]
+          assert (pp == pv)
+        )
+        success
+        (equivUpToNormalization p v)
+    )
+    (parse $ fromString prog)
  where
+  prog = show $ prettyNix p
+
   parse     = parseNixText
 
-  normalise = unlines . map (reverse . dropWhile isSpace . reverse) . lines
+  normalise s = String.unlines $ reverse . dropWhile isSpace . reverse <$> String.lines s
 
-  diff :: String -> String -> [Diff [String]]
-  diff s1 s2 = getDiff (map (: []) (lines s1)) (map (: []) (lines s2))
+  ldiff :: String -> String -> [Diff [String]]
+  ldiff s1 s2 = getDiff (one <$> String.lines s1) (one <$> String.lines s2)
 
 tests :: TestLimit -> TestTree
-tests n = testProperty "Pretty/Parse Property" $ withTests n $ property $ do
-  x <- forAll genExpr
-  prop_prettyparse x
+tests n =
+  testProperty "Pretty/Parse Property" $
+    withTests n $ property $ prop_prettyparse =<< forAll genExpr
