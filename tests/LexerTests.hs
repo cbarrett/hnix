@@ -5,6 +5,7 @@
 {-# OPTIONS_GHC -Wno-missing-signatures #-}
 module LexerTests (tests) where
 
+import           Prelude
 import           Data.Text (Text)
 import qualified Data.Text as T
 
